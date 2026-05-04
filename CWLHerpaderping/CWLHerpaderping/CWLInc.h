@@ -233,6 +233,17 @@ typedef NTSYSAPI NTSTATUS(NTAPI* _NtQueryInformationProcess)(
 	IN ULONG ProcessInformationLength,
 	OUT PULONG ReturnLength OPTIONAL);
 
+typedef struct _PROCESS_ACCESS_TOKEN {
+	HANDLE Token;
+	HANDLE Thread;
+} PROCESS_ACCESS_TOKEN, *PPROCESS_ACCESS_TOKEN;
+
+typedef NTSYSAPI NTSTATUS(NTAPI* _NtSetInformationProcess)(
+	IN HANDLE ProcessHandle,
+	IN PROCESSINFOCLASS ProcessInformationClass,
+	IN PVOID ProcessInformation,
+	IN ULONG ProcessInformationLength);
+
 
 typedef NTSYSAPI NTSTATUS(NTAPI* _NtReadVirtualMemory)(
 	_In_		HANDLE ProcessHandle,

