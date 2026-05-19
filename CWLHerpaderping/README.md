@@ -12,9 +12,15 @@ _Herpaderping creates a ghost process by mapping a payload into a memory section
 main()
  └─ PatchEtw()                         ← B1: suppress ETW (T1562.006)
  └─ GetPayloadBuffer()
-     ├─ CreateFileW(PAYLOAD_PATH)
-     ├─ ReadFile → heap buffer
-     └─ DeleteFileW(PAYLOAD_PATH)       ← anti-forensic: payload removed from disk
+     ├─ GetFileType(STD_INPUT_HANDLE) → check stdin type
+     ├─ MODE 1 (stdin pipe - T1620):
+     │   ├─ ReadFile(stdin, 4-byte size)
+     │   ├─ VirtualAlloc(size)
+     │   └─ ReadFile(stdin, payload)    ← reflective: NO disk file
+     └─ MODE 2 (file fallback - T1070.004):
+         ├─ CreateFileW(PAYLOAD_PATH)
+         ├─ ReadFile → heap buffer
+         └─ DeleteFileW(PAYLOAD_PATH)   ← anti-forensic: payload deleted
  └─ Herpaderping(buffer, size)
      ├─ InitSyscallPool / INDIRECT_SYSCALL × 5   ← B2: indirect syscalls
      ├─ SealSyscallPool()               ← flip stub page to PAGE_EXECUTE_READ
@@ -39,8 +45,10 @@ main()
 | Step | API / Action | Description |
 |------|-------------|-------------|
 | 0 | `PatchEtw()` | Patch `ntdll!EtwEventWrite` → `xor eax,eax; ret` — suppress ETW before any NT call (T1562.006) |
-| 1 | `CreateFileW` / `ReadFile` | Read payload from `PAYLOAD_PATH` into heap buffer |
-| 2 | `DeleteFileW(PAYLOAD_PATH)` | Delete payload file immediately after read — anti-forensic |
+| 1a | `GetFileType(STD_INPUT_HANDLE)` | Check if stdin is a pipe (reflective mode trigger) |
+| 1b-MODE1 | `ReadFile(stdin)` | Read 4-byte size + payload bytes from stdin pipe — **T1620 Reflective Code Loading** (NO disk file) |
+| 1b-MODE2 | `CreateFileW` / `ReadFile` | Read payload from `PAYLOAD_PATH` into heap buffer |
+| 2-MODE2 | `DeleteFileW(PAYLOAD_PATH)` | Delete payload file immediately after read — **T1070.004 File Deletion** |
 | 3 | `InitSyscallPool` / `INDIRECT_SYSCALL` × 5 | Resolve SSNs for `NtCreateSection`, `NtCreateProcessEx`, `NtAllocateVirtualMemory`, `NtWriteVirtualMemory`, `NtCreateThreadEx`; `SealSyscallPool()` flips stub page to `PAGE_EXECUTE_READ` |
 | 4 | `GetTempFileNameW` / `CreateFileW` | Create temp file in `%TEMP%` with prefix `HD` to hold payload bytes |
 | 5 | `WriteFile` | Write payload bytes into temp file |
@@ -200,9 +208,32 @@ spoofer.Deactivate();
 | PPID patch only | `svchost.exe` | Session 0 | `svchost.exe` token |
 | PPID + token fixup | `svchost.exe` | Session 0 | **Caller token (SYSTEM or domain user)** |
 
-## Payload Path
+## Payload Loading Modes
 
-Default compile-time path (`CWLImplant.cpp` line 13):
+### Mode 1: Reflective Loading via Stdin (T1620)
+
+**Trigger:** Parent process spawns `CertEnrollAgent.exe` with stdin pipe redirection
+
+**Example (Node.js):**
+```javascript
+const result = child_process.spawnSync(
+    'C:/ProgramData/CertEnrollAgent.exe',
+    [],
+    { input: payloadBuffer } // stdin redirected with PE bytes
+);
+```
+
+**Payload format:** 4-byte little-endian size header + PE file bytes
+
+**Key benefit:** Payload **never written to disk** - loaded directly into memory from pipe
+
+**ATT&CK:** T1620 Reflective Code Loading
+
+### Mode 2: File-based Loading with Deletion (T1070.004)
+
+**Trigger:** Stdin is not a pipe (normal console or file handle)
+
+**Default compile-time path (`CWLImplant.cpp` line 13):**
 
 ```cpp
 #ifndef PAYLOAD_PATH
@@ -210,14 +241,20 @@ Default compile-time path (`CWLImplant.cpp` line 13):
 #endif
 ```
 
-Override at build time via MSBuild (used in emulation plan):
+**Override at build time via MSBuild (used in emulation plan):**
 
 ```powershell
 msbuild CWLHerpaderping.sln /p:Configuration=Release /p:Platform=x64 `
     /p:CustomPayloadPath="C:\\ProgramData\\CertCA.bin" /t:Rebuild /m
 ```
 
-In the emulation plan the payload is deployed to `C:\ProgramData\CertCA.bin`.
+**Key behavior:** Payload read from disk then **immediately deleted** via `DeleteFileW`
+
+**ATT&CK:** T1070.004 Indicator Removal: File Deletion
+
+**Emulation plan usage:**
+- **Phase 1 Step 3A:** Mode 1 (reflective) via `herpload` command
+- **Phase 1 Step 3B:** Mode 2 (file-based) via EfsPotato escalation
 
 ## Payload Requirements
 
@@ -228,6 +265,18 @@ In the emulation plan the payload is deployed to `C:\ProgramData\CertCA.bin`.
 
 ## IOCs for Detection
 
+### Mode 1 (Reflective Loading) Indicators:
+- Parent process spawns `CertEnrollAgent.exe` with stdin pipe containing PE file bytes (no command-line args for payload path)
+- `GetFileType(STD_INPUT_HANDLE)` returns `FILE_TYPE_PIPE` in loader process
+- **No payload file on disk** - payload transferred entirely via pipe
+- Process creation event shows stdin redirection
+
+### Mode 2 (File-based) Indicators:
+- `CreateFileW` + `ReadFile` on payload path (e.g., `C:\ProgramData\CertCA.bin`)
+- `DeleteFileW` called immediately after read - file creation followed by deletion within seconds
+- Payload file exists briefly then disappears
+
+### Common Indicators (Both Modes):
 - Process whose on-disk image (`HD*.tmp`) contains junk (`Hello From CyberWarFare Labs`) that does not match the in-memory mapped section
 - `NtCreateProcessEx` called with a `SectionHandle` argument — spawning from section rather than from an image file path
 - `ProcessParameters.ImagePathName` = `RuntimeBroker.exe` while `PEB.ImageBaseAddress` maps to a different PE
