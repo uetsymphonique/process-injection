@@ -1,4 +1,5 @@
 #include "StackSpoof.h"
+#include "obfstr.h"
 #include <stdio.h>
 #include <intrin.h>  // For _AddressOfReturnAddress intrinsic
 
@@ -10,6 +11,7 @@ const BYTE RET_PATTERN[] = { 0xC3 };
 const BYTE EPILOGUE_PATTERN[] = { 0x48, 0x83, 0xC4, 0x28, 0xC3 };
 
 PVOID FindReturnAddressGadget(const char* moduleName) {
+    // moduleName is already obfuscated by caller, use directly
     HMODULE hModule = GetModuleHandleA(moduleName);
     if (!hModule) return NULL;
 

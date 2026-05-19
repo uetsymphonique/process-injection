@@ -131,7 +131,6 @@ typedef struct _IO_STATUS_BLOCK
 	ULONG Information;
 } IO_STATUS_BLOCK, * PIO_STATUS_BLOCK;
 
-
 typedef FARPROC(WINAPI* _GetProcAddress)(
 	HMODULE hModule,
 	LPCSTR  lpProcName

