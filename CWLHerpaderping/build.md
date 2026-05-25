@@ -117,6 +117,25 @@ msbuild CWLHerpaderping.sln /p:Configuration=Release /p:Platform=x64 /p:CustomPa
 - No need for `L\"` prefix
 - The path is automatically converted to a wide string literal at compile time
 
+### ETW Patching (Compile-Time, Opt-In)
+
+ETW patching (`T1562.006`) is **disabled by default**. To enable it, pass `ENABLE_ETW_PATCH` as a preprocessor definition:
+
+```bash
+# Build WITH ETW patching (T1562.006 active)
+msbuild CWLHerpaderping.sln /p:Configuration=Release /p:Platform=x64 /p:PreprocessorDefinitions="ENABLE_ETW_PATCH"
+
+# Build WITHOUT ETW patching (default — cleaner profile)
+msbuild CWLHerpaderping.sln /p:Configuration=Release /p:Platform=x64
+
+# Combine with custom payload path
+msbuild CWLHerpaderping.sln /p:Configuration=Release /p:Platform=x64 /p:PreprocessorDefinitions="ENABLE_ETW_PATCH" /p:CustomPayloadPath="C:\\temp\\implant.exe"
+```
+
+**When to enable:**
+- Lab environments where ETW-based detection coverage needs to be tested
+- Scenarios explicitly emulating T1562.006
+
 ## Example Build Commands
 
 ### Build Release with verbose output
