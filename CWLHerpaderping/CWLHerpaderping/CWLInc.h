@@ -580,3 +580,100 @@ typedef NTSYSAPI NTSTATUS(NTAPI* _NtSetInformationFile)(
 	IN ULONG Length,
 	IN FILE_INFORMATION_CLASS FileInformationClass
 	);
+
+#define THREAD_CREATE_FLAGS_CREATE_SUSPENDED 0x00000001
+#define PS_ATTRIBUTE_IMAGE_NAME 0x00020005
+
+typedef enum _PS_CREATE_STATE {
+	PsCreateInitialState,
+	PsCreateFailOnFileOpen,
+	PsCreateFailOnSectionCreate,
+	PsCreateFailExeFormat,
+	PsCreateFailMachineMismatch,
+	PsCreateFailExeName,
+	PsCreateSuccess,
+	PsCreateMaximumStates
+} PS_CREATE_STATE;
+
+typedef struct _PS_CREATE_INFO {
+	SIZE_T Size;
+	PS_CREATE_STATE State;
+	union {
+		struct {
+			union {
+				ULONG InitFlags;
+				struct {
+					UCHAR WriteOutputOnExit : 1;
+					UCHAR DetectManifest : 1;
+					UCHAR IFEOSkipDebugger : 1;
+					UCHAR IFEODoNotPropagateKeyState : 1;
+					UCHAR SpareBits1 : 4;
+					UCHAR SpareBits2 : 8;
+					USHORT ProhibitedImageCharacteristics : 16;
+				};
+			};
+			ACCESS_MASK AdditionalFileAccess;
+		} InitState;
+		struct { HANDLE FileHandle; } FailSection;
+		struct { USHORT DllCharacteristics; } ExeFormat;
+		struct { HANDLE IFEOKey; } ExeName;
+		struct {
+			union {
+				ULONG OutputFlags;
+				struct {
+					UCHAR ProtectedProcess : 1;
+					UCHAR AddressSpaceOverride : 1;
+					UCHAR DevOverrideEnabled : 1;
+					UCHAR ManifestDetected : 1;
+					UCHAR ProtectedProcessLight : 1;
+					UCHAR SpareBits1a : 3;
+					UCHAR SpareBits2a : 8;
+					USHORT SpareBits3 : 16;
+				};
+			};
+			HANDLE FileHandle;
+			HANDLE SectionHandle;
+			ULONGLONG UserProcessParametersNative;
+			ULONG UserProcessParametersWow64;
+			ULONG CurrentParameterFlags;
+			ULONGLONG PebAddressNative;
+			ULONG PebAddressWow64;
+			ULONGLONG ManifestAddress;
+			ULONG ManifestSize;
+		} SuccessState;
+	};
+} PS_CREATE_INFO, *PPS_CREATE_INFO;
+
+typedef struct _PS_ATTRIBUTE {
+	ULONG_PTR Attribute;
+	SIZE_T Size;
+	union {
+		ULONG_PTR Value;
+		PVOID ValuePtr;
+	};
+	PSIZE_T ReturnLength;
+} PS_ATTRIBUTE, *PPS_ATTRIBUTE;
+
+typedef struct _PS_ATTRIBUTE_LIST {
+	SIZE_T TotalLength;
+	PS_ATTRIBUTE Attributes[2];
+} PS_ATTRIBUTE_LIST, *PPS_ATTRIBUTE_LIST;
+
+typedef NTSYSAPI NTSTATUS(NTAPI* _NtCreateUserProcess)(
+	PHANDLE ProcessHandle,
+	PHANDLE ThreadHandle,
+	ACCESS_MASK ProcessDesiredAccess,
+	ACCESS_MASK ThreadDesiredAccess,
+	POBJECT_ATTRIBUTES ProcessObjectAttributes,
+	POBJECT_ATTRIBUTES ThreadObjectAttributes,
+	ULONG ProcessFlags,
+	ULONG ThreadFlags,
+	PRTL_USER_PROCESS_PARAMETERS ProcessParameters,
+	PPS_CREATE_INFO CreateInfo,
+	PPS_ATTRIBUTE_LIST AttributeList
+	);
+
+typedef NTSYSAPI NTSTATUS(NTAPI* _NtResumeThread)(
+	HANDLE ThreadHandle,
+	PULONG PreviousSuspendCount
+	);

