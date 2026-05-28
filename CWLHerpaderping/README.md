@@ -9,7 +9,7 @@ _Herpaderping creates a ghost process by mapping a payload into a memory section
 ## Execution Flow
 
 ```
-main()
+wmain()
  └─ PatchEtw()                         ← B1: suppress ETW (T1562.006) [only if ENABLE_ETW_PATCH defined]
  └─ GetPayloadBuffer()
      ├─ GetFileType(STD_INPUT_HANDLE) → check stdin type
@@ -20,6 +20,8 @@ main()
      └─ MODE 2 (file fallback - T1070.004):
          ├─ CreateFileW(PAYLOAD_PATH)
          ├─ ReadFile → heap buffer
+         ├─ [#ifdef ENABLE_PAYLOAD_XOR] XOR decode in-place ← T1027.013
+         │     └─ decoded[i] = buf[i] ^ ((0xA3 + i * 0x5B) & 0xFF)
          └─ DeleteFileW(PAYLOAD_PATH)   ← anti-forensic: payload deleted
  └─ Herpaderping(buffer, size)
      ├─ InitSyscallPool / INDIRECT_SYSCALL × 1   ← B2: indirect syscall (NtCreateUserProcess only)
@@ -46,6 +48,7 @@ main()
 | 1a | `GetFileType(STD_INPUT_HANDLE)` | Check if stdin is a pipe (reflective mode trigger) |
 | 1b-MODE1 | `ReadFile(stdin)` | Read 4-byte size + payload bytes from stdin pipe — **T1620 Reflective Code Loading** (NO disk file) |
 | 1b-MODE2 | `CreateFileW` / `ReadFile` | Read payload from `PAYLOAD_PATH` into heap buffer |
+| 1c-MODE2 | XOR decode (in-place, conditional) | `decoded[i] = buf[i] ^ ((0xA3 + i * 0x5B) & 0xFF)` — **T1027.013** — only when compiled with `ENABLE_PAYLOAD_XOR`; no-op otherwise |
 | 2-MODE2 | `DeleteFileW(PAYLOAD_PATH)` | Delete payload file immediately after read — **T1070.004 File Deletion** |
 | 3 | `InitSyscallPool` / `INDIRECT_SYSCALL` × 1 | Resolve SSN for `NtCreateUserProcess` only; `SealSyscallPool()` flips stub page to `PAGE_EXECUTE_READ` |
 | 4 | `RtlCreateProcessParametersEx` | Build spoofed `RTL_USER_PROCESS_PARAMETERS` with `ImagePathName = RuntimeBroker.exe` **[GetProcAddress]** |
@@ -161,6 +164,27 @@ spoofer.Deactivate();
 
 ---
 
+### B6 — XOR Payload Decode (`CWLImplant.cpp`, `GetPayloadBuffer` Mode 2)
+
+**Purpose:** On-disk payload file is stored XOR-encoded so it does not have a valid MZ header. The binary decodes it in memory before use, preventing static AV from identifying the file as a PE. **T1027.013 — Obfuscated Files or Information: Encrypted/Encoded File.**
+
+**Conditional compilation:** Entire decode block is wrapped in `#ifdef ENABLE_PAYLOAD_XOR`. Without it, the raw file bytes are used directly.
+
+**Applies to Mode 2 only.** Mode 1 (stdin pipe) receives plain PE bytes — no XOR in the pipe path.
+
+```cpp
+#ifdef ENABLE_PAYLOAD_XOR
+const BYTE PAYLOAD_XOR_BASE = 0xA3;
+const BYTE PAYLOAD_XOR_STEP = 0x5B;
+for (size_t i = 0; i < p_size; i++)
+    bufferAddress[i] ^= (BYTE)((PAYLOAD_XOR_BASE + i * PAYLOAD_XOR_STEP) & 0xFF);
+#endif
+```
+
+Formula is self-inverse (XOR): encoding and decoding use the same function. First byte: `0x4D ('M') ^ 0xA3 = 0xEE` — the encoded file does not start with `MZ`.
+
+---
+
 ### Combined Effect
 
 | Scenario | Ghost PPID | Ghost Session | Ghost Token |
@@ -215,8 +239,8 @@ msbuild CWLHerpaderping.sln /p:Configuration=Release /p:Platform=x64 `
 **ATT&CK:** T1070.004 Indicator Removal: File Deletion
 
 **Emulation plan usage:**
-- **Phase 1 Step 3A:** Mode 1 (reflective) via `herpload` command
-- **Phase 1 Step 3B:** Mode 2 (file-based) via EfsPotato escalation
+- Mode 2 (file-based) is the primary path when spawned by a privilege escalation tool as SYSTEM with no stdin pipe; reads `CertCA.bin` (XOR-decoded if built with `ENABLE_PAYLOAD_XOR`) then deletes it
+- Mode 1 (reflective) is the alternate path when parent spawns the binary with `[4-byte LE size][PE bytes]` on stdin
 
 ## Payload Requirements
 
@@ -228,15 +252,20 @@ msbuild CWLHerpaderping.sln /p:Configuration=Release /p:Platform=x64 `
 ## IOCs for Detection
 
 ### Mode 1 (Reflective Loading) Indicators:
-- Parent process spawns `CertEnrollAgent.exe` with stdin pipe containing PE file bytes (no command-line args for payload path)
-- `GetFileType(STD_INPUT_HANDLE)` returns `FILE_TYPE_PIPE` in loader process
-- **No payload file on disk** - payload transferred entirely via pipe
+- Parent process spawns the loader with stdin pipe containing `[4-byte LE size][PE bytes]`
+- `GetFileType(STD_INPUT_HANDLE)` returns `FILE_TYPE_PIPE` in the loader process
+- **No payload file on disk** — payload transferred entirely via pipe
 - Process creation event shows stdin redirection
 
 ### Mode 2 (File-based) Indicators:
 - `CreateFileW` + `ReadFile` on payload path (e.g., `C:\ProgramData\CertCA.bin`)
 - `DeleteFileW` called immediately after read - file creation followed by deletion within seconds
 - Payload file exists briefly then disappears
+
+### XOR Decode (Mode 2, `ENABLE_PAYLOAD_XOR` only):
+- Payload file on disk (`CertCA.bin`) does **not** start with `MZ` (first byte = `0xEE`)
+- In-memory payload is a valid PE after decode — discrepancy between on-disk bytes and in-process memory
+- `CertCA.bin` → `0xEE` first byte; decoded buffer → `0x4D` (`M`) first byte
 
 ### Common Indicators (Both Modes):
 - Process whose on-disk image (`HD*.tmp`) contains junk (`Hello From CyberWarFare Labs`) that does not match the in-memory image

