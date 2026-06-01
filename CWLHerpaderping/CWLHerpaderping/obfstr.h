@@ -5,27 +5,28 @@
 // Strings are encrypted at compile time with XOR key and decrypted on stack at runtime
 // No plaintext API names or DLL names visible in .rdata section
 
-template<size_t N, BYTE KEY = 0x5A>
+template<size_t N>
 class ObfStr {
 private:
     char encrypted[N];
 
+    static constexpr BYTE _key(size_t i) {
+        return (BYTE)((0xA3 + i * 0x5B) & 0xFF);
+    }
+
 public:
-    // Compile-time encryption
     constexpr ObfStr(const char(&str)[N]) : encrypted{} {
         for (size_t i = 0; i < N; i++) {
-            encrypted[i] = str[i] ^ KEY;
+            encrypted[i] = str[i] ^ _key(i);
         }
     }
 
-    // Runtime decryption to stack buffer
     void decrypt(char* buffer) const {
         for (size_t i = 0; i < N; i++) {
-            buffer[i] = encrypted[i] ^ KEY;
+            buffer[i] = encrypted[i] ^ _key(i);
         }
     }
 
-    // Helper: decrypt and return stack pointer
     char* get() const {
         static thread_local char buffer[N];
         decrypt(buffer);
@@ -34,21 +35,25 @@ public:
 };
 
 // Compile-time XOR obfuscation for wide strings (wchar_t*)
-template<size_t N, BYTE KEY = 0x5A>
+template<size_t N>
 class ObfWStr {
 private:
     wchar_t encrypted[N];
 
+    static constexpr BYTE _key(size_t i) {
+        return (BYTE)((0xA3 + i * 0x5B) & 0xFF);
+    }
+
 public:
     constexpr ObfWStr(const wchar_t(&str)[N]) : encrypted{} {
         for (size_t i = 0; i < N; i++) {
-            encrypted[i] = str[i] ^ KEY;
+            encrypted[i] = str[i] ^ (wchar_t)_key(i);
         }
     }
 
     void decrypt(wchar_t* buffer) const {
         for (size_t i = 0; i < N; i++) {
-            buffer[i] = encrypted[i] ^ KEY;
+            buffer[i] = encrypted[i] ^ (wchar_t)_key(i);
         }
     }
 

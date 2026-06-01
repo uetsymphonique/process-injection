@@ -134,6 +134,7 @@ namespace ApiHash {
     const DWORD RtlImageNtHeader = 0xC63A2FA5;
     const DWORD NtReadVirtualMemory = 0xC24062E3;
     const DWORD EtwEventWrite = 0x24A8D022;  // B1: ETW patch target — T1562.006
+    const DWORD NtCreateUserProcess = 0x5F8E4559;
 }
 
 // Helper macro to resolve API by hash

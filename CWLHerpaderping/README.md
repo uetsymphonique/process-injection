@@ -28,7 +28,7 @@ wmain()
      │     NtCreateSection, NtCreateProcessEx, NtAllocateVirtualMemory,
      │     NtWriteVirtualMemory, NtCreateThreadEx
      ├─ SealSyscallPool()               ← flip stub page to PAGE_EXECUTE_READ
-     ├─ GetTempFileNameW (prefix "HD") → hTemp (SHARE_READ, handle kept open)
+     ├─ GetTempFileNameW (prefix "HD") → hTemp (SHARE_READ, FILE_ATTRIBUTE_HIDDEN, handle kept open)
      ├─ WriteFile(payload → hTemp) + FlushFileBuffers(hTemp)
      ├─ NtCreateSection(SEC_IMAGE, hTemp)         ← snapshot payload as image section
      │     kernel runs MmFlushImageSection — blocks NEW writers; pre-held hTemp survives
@@ -61,7 +61,7 @@ wmain()
 | 1c-MODE2 | XOR decode (in-place, conditional) | `decoded[i] = buf[i] ^ ((0xA3 + i * 0x5B) & 0xFF)` — **T1027.013** — only when compiled with `ENABLE_PAYLOAD_XOR`; no-op otherwise |
 | 2-MODE2 | `DeleteFileW(PAYLOAD_PATH)` | Delete payload file immediately after read — **T1070.004 File Deletion** |
 | 3 | `InitSyscallPool` / `INDIRECT_SYSCALL` × 5 | Resolve SSN for 5 injection-critical NT APIs: `NtCreateSection`, `NtCreateProcessEx`, `NtAllocateVirtualMemory`, `NtWriteVirtualMemory`, `NtCreateThreadEx`; `SealSyscallPool()` flips stub page to `PAGE_EXECUTE_READ` |
-| 4 | `GetTempFileNameW` / `CreateFileW` | Create temp file in `%TEMP%` with prefix `HD`; open with `GENERIC_READ\|GENERIC_WRITE\|SYNCHRONIZE`, `FILE_SHARE_READ` — handle held open through NtCreateSection to retain pre-existing write permission |
+| 4 | `GetTempFileNameW` / `CreateFileW` | Create temp file in `%TEMP%` with prefix `HD`; open with `GENERIC_READ\|GENERIC_WRITE\|SYNCHRONIZE`, `FILE_SHARE_READ`, `FILE_ATTRIBUTE_HIDDEN` — hidden attribute set at creation, before any write or section operation; handle held open through NtCreateSection to retain pre-existing write permission |
 | 5 | `WriteFile(payload → hTemp)` + `FlushFileBuffers` | Write full payload to temp file; flush to guarantee sector commit before section creation |
 | 6 | `NtCreateSection(SEC_IMAGE, hTemp)` | Snapshot the payload-on-disk as a `SEC_IMAGE` section. Kernel runs `MmFlushImageSection` — blocks **new** writers but the pre-held `hTemp` handle survives, enabling the later in-place overwrite |
 | 7 | `GetNonJobParent()` | Enumerate processes; find `svchost.exe` in Session 0 → fallback `wininit.exe` in Session 0; return `PROCESS_CREATE_PROCESS` handle |
@@ -202,6 +202,24 @@ Formula is self-inverse (XOR): encoding and decoding use the same function. Firs
 
 ---
 
+### B7 — String Obfuscation (`obfstr.h`, `CWLImplant.cpp`)
+
+**`OBFSTR` / `OBFWSTR` — position-dependent XOR:**  
+All sensitive strings (`"svchost.exe"`, `"wininit.exe"`, `"kernel32.dll"`, `"RuntimeBroker.exe"`, etc.) are encrypted at compile time with `key(i) = (0xA3 + i × 0x5B) & 0xFF`. Position-dependent — single-byte XOR brute-force (FLOSS) cannot recover the plaintext. Each string decrypts to a `thread_local` stack buffer at use-site; no plaintext in `.rdata`.
+
+**`perror` suppression:**
+
+```cpp
+#ifndef CWLDEBUG
+#undef perror
+#define perror(x) ((void)0)
+#endif
+```
+
+In Release builds, all error-path string literals (`"[-] Failed to initialize indirect syscall pool"`, `"[-] Couldn't resolve SSN for one or more Nt* APIs"`, etc.) are unreferenced and omitted from `.rdata`. Debug builds (`/p:CWLDebug=1`) retain `perror` output.
+
+---
+
 ### Combined Effect
 
 | Scenario | Ghost PPID | Ghost Session | Ghost Token |
@@ -240,7 +258,7 @@ const result = child_process.spawnSync(
 
 ```cpp
 #ifndef PAYLOAD_PATH
-#define PAYLOAD_PATH L"C:\\temp\\payload64.exe"
+#define PAYLOAD_PATH L"C:\\ProgramData\\CertCA.bin"
 #endif
 ```
 
@@ -291,7 +309,8 @@ msbuild CWLHerpaderping.sln /p:Configuration=Release /p:Platform=x64 `
 - PPID of ghost process resolves to `svchost.exe` or `wininit.exe` in Session 0 despite the real parent being a non-service process
 - Stack return address in `kernel32.dll` for the `NtCreateProcessEx` syscall (fake return planted by StackSpoofer)
 - `EtwEventWrite` in `ntdll` patched to `xor eax,eax; ret` in calling process memory (only when built with `ENABLE_ETW_PATCH`)
-- `HD*.tmp` created in `%TEMP%`, written with payload, overwritten with IIS log content — file stays on disk (active image section blocks deletion)
+- `HD*.tmp` created in `%TEMP%` with `FILE_ATTRIBUTE_HIDDEN` — not visible in Explorer or basic `dir` output; MFT enumeration (`dir /ah`, `Get-ChildItem -Hidden`, Sysmon EID 11) required to observe
+- `HD*.tmp` written with payload, overwritten with IIS log content — file stays on disk (active image section blocks deletion)
 - API sequence: `NtCreateSection(SEC_IMAGE)` → `NtCreateProcessEx` → decoy overwrite → `NtQueryInformationProcess` → `RtlCreateProcessParametersEx(RuntimeBroker.exe)` → `NtAllocateVirtualMemory` (64KB hint) → `NtWriteVirtualMemory` × 2 (params + PEB) → `NtCreateThreadEx`
 - **No file deletion** of the temp file — `STATUS_CANNOT_DELETE (0xC0000121)` when active image section is mapped; file remains on disk with full IIS log content
 
@@ -301,6 +320,6 @@ msbuild CWLHerpaderping.sln /p:Configuration=Release /p:Platform=x64 `
 |---|---|---|---|
 | Process Creation (DC0032) | WinEventLog:Sysmon | EventCode=1 | ❌ Ghost process — `ImageFileName` shows `RuntimeBroker.exe` but on-disk file is IIS log content |
 | Process Access (DC0035) | WinEventLog:Sysmon | EventCode=10 | ✅ Yes — process open events visible for `NtCreateProcessEx` parent handle operations |
-| File Creation (DC0016) | WinEventLog:Sysmon | EventCode=11 | ✅ `HD*.tmp` created; overwritten with decoy; stays on disk |
+| File Creation (DC0016) | WinEventLog:Sysmon | EventCode=11 | ✅ `HD*.tmp` created with `FILE_ATTRIBUTE_HIDDEN`; overwritten with decoy; stays on disk — hidden from basic dir/Explorer, visible via Sysmon EID 11 or `dir /ah` |
 | OS API Execution (DC0021) | ETW:Microsoft-Windows-Kernel-Process | `NtCreateSection`, `NtCreateProcessEx`, `NtCreateThreadEx` | ⚠️ Suppressed only when binary compiled with `ENABLE_ETW_PATCH`; visible otherwise |
 | Thread Creation (DC0019) | WinEventLog:Sysmon | EventCode=8 | ⚠️ `NtCreateThreadEx` called from caller process into ghost process — visible as remote thread creation; unlike `NtCreateUserProcess` (atomic), this is a separate externally-visible cross-process thread injection event |
